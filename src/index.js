@@ -72,14 +72,35 @@ async function publishJob({ client, channelId, shopKey, caption, mediaFiles }) {
   if (mediaFiles.length === 1) {
     const f = mediaFiles[0];
     const isVideo = /\.mp4$/i.test(f.name);
-    const creationId = await igCreateMediaContainer({
-      igUserId: cfg.igUserId,
-      pageToken: cfg.pageToken,
-      imageUrl: isVideo ? null : driveDirectDownloadUrl(f.id),
-      videoUrl: isVideo ? driveDirectDownloadUrl(f.id) : null,
-      caption,
-      isCarouselItem: false
-    });
+    const f = mediaFiles[0];
+const isVideo = /\.mp4$/i.test(f.name);
+
+const mediaUrl = driveDirectDownloadUrl(f.id);
+const safeUrl = mediaUrl.replace(/token=[^&]+/i, "token=***");
+
+if (!mediaUrl || !mediaUrl.startsWith("https://")) {
+  throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${f.name} | id=${f.id}`);
+}
+
+// HEAD test trước khi gửi sang Meta (đỡ đoán mò)
+const head = await axios.head(mediaUrl).catch(err => err.response);
+const ct = head?.headers?.["content-type"] || "";
+const status = head?.status;
+
+console.log("[MEDIA-HEAD]", status, ct, safeUrl, f.name);
+
+if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
+  throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
+}
+
+const creationId = await igCreateMediaContainer({
+  igUserId: cfg.igUserId,
+  pageToken: cfg.pageToken,
+  imageUrl: isVideo ? null : mediaUrl,
+  videoUrl: isVideo ? mediaUrl : null,
+  caption,
+  isCarouselItem: false
+});
 
     if (isVideo) {
       await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
@@ -94,6 +115,24 @@ async function publishJob({ client, channelId, shopKey, caption, mediaFiles }) {
   const childrenIds = [];
   for (const f of mediaFiles) {
     const isVideo = /\.mp4$/i.test(f.name);
+
+    const mediaUrl = driveDirectDownloadUrl(f.id);
+const safeUrl = mediaUrl.replace(/token=[^&]+/i, "token=***");
+
+if (!mediaUrl || !mediaUrl.startsWith("https://")) {
+  throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${f.name} | id=${f.id}`);
+}
+
+const head = await axios.head(mediaUrl).catch(err => err.response);
+const ct = head?.headers?.["content-type"] || "";
+const status = head?.status;
+
+console.log("[MEDIA-HEAD]", status, ct, safeUrl, f.name);
+
+if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
+  throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
+}
+    
     const childCreationId = await igCreateMediaContainer({
       igUserId: cfg.igUserId,
       pageToken: cfg.pageToken,
