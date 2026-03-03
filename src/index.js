@@ -1,16 +1,37 @@
+// src/index.js
 const axios = require("axios");
 const http = require("http");
-const { createMediaHandler } = require("./media-server");
+
 const { Client, GatewayIntentBits } = require("discord.js");
 const { DateTime } = require("luxon");
 
 const { mustEnv } = require("./utils");
 const { getClients } = require("./google");
+const { createMediaHandler } = require("./media-server");
 
-let mediaServerStarted = false;
-const { parseFolderIdFromUrl, getFolderName, deriveSkuFromFolderName, listMediaFiles, driveDirectDownloadUrl } = require("./drive");
-const { parseVnDatetime, appendJob, fetchAllJobs, updateRow, nowVn } = require("./queue");
-const { igCreateMediaContainer, igCreateCarouselContainer, igPublish, igGetPermalink, waitUntilFinished } = require("./ig");
+const {
+  parseFolderIdFromUrl,
+  getFolderName,
+  deriveSkuFromFolderName,
+  listMediaFiles,
+  driveDirectDownloadUrl
+} = require("./drive");
+
+const {
+  parseVnDatetime,
+  appendJob,
+  fetchAllJobs,
+  updateRow,
+  nowVn
+} = require("./queue");
+
+const {
+  igCreateMediaContainer,
+  igCreateCarouselContainer,
+  igPublish,
+  igGetPermalink,
+  waitUntilFinished
+} = require("./ig");
 
 const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
@@ -23,9 +44,9 @@ const SHOP = {
     pageToken: mustEnv("FB_PAGE_TOKEN_MAUME"),
     sheetId: mustEnv("SHEET_ID_MAUME"),
     sheetTab: process.env.SHEET_TAB_MAUME || null,
-    // MauMe: caption col E, code col L
+    // MauMe: caption col E, code col L -> range E:L
     captionColIndexInRange: 0, // E in E:L
-    codeColIndexInRange: 7       // L in E:L
+    codeColIndexInRange: 7     // L in E:L
   },
   BURGER: {
     name: "Burger",
@@ -65,42 +86,44 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   return null;
 }
 
-async function publishJob({ client, channelId, shopKey, caption, mediaFiles }) {
+async function validateMediaUrl(mediaUrl, fileName) {
+  const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
+
+  if (!mediaUrl || !mediaUrl.startsWith("https://")) {
+    throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${fileName}`);
+  }
+
+  // HEAD check: đảm bảo URL trả đúng media
+  const headResp = await axios.head(mediaUrl).catch(err => err.response);
+  const status = headResp?.status;
+  const ct = headResp?.headers?.["content-type"] || "";
+
+  console.log("[MEDIA-HEAD]", status, ct, safeUrl, fileName);
+
+  if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
+    throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
+  }
+}
+
+async function publishJob({ shopKey, caption, mediaFiles }) {
   const cfg = SHOP[shopKey];
 
   // Single media
   if (mediaFiles.length === 1) {
     const f = mediaFiles[0];
     const isVideo = /\.mp4$/i.test(f.name);
-    const f = mediaFiles[0];
-const isVideo = /\.mp4$/i.test(f.name);
 
-const mediaUrl = driveDirectDownloadUrl(f.id);
-const safeUrl = mediaUrl.replace(/token=[^&]+/i, "token=***");
+    const mediaUrl = driveDirectDownloadUrl(f.id);
+    await validateMediaUrl(mediaUrl, f.name);
 
-if (!mediaUrl || !mediaUrl.startsWith("https://")) {
-  throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${f.name} | id=${f.id}`);
-}
-
-// HEAD test trước khi gửi sang Meta (đỡ đoán mò)
-const head = await axios.head(mediaUrl).catch(err => err.response);
-const ct = head?.headers?.["content-type"] || "";
-const status = head?.status;
-
-console.log("[MEDIA-HEAD]", status, ct, safeUrl, f.name);
-
-if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
-  throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
-}
-
-const creationId = await igCreateMediaContainer({
-  igUserId: cfg.igUserId,
-  pageToken: cfg.pageToken,
-  imageUrl: isVideo ? null : mediaUrl,
-  videoUrl: isVideo ? mediaUrl : null,
-  caption,
-  isCarouselItem: false
-});
+    const creationId = await igCreateMediaContainer({
+      igUserId: cfg.igUserId,
+      pageToken: cfg.pageToken,
+      imageUrl: isVideo ? null : mediaUrl,
+      videoUrl: isVideo ? mediaUrl : null,
+      caption,
+      isCarouselItem: false
+    });
 
     if (isVideo) {
       await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
@@ -111,39 +134,27 @@ const creationId = await igCreateMediaContainer({
     return { mediaId, permalink };
   }
 
-  // Carousel: create children first, then parent carousel (<=10). :contentReference[oaicite:15]{index=15}
+  // Carousel (<=10)
   const childrenIds = [];
   for (const f of mediaFiles) {
     const isVideo = /\.mp4$/i.test(f.name);
 
     const mediaUrl = driveDirectDownloadUrl(f.id);
-const safeUrl = mediaUrl.replace(/token=[^&]+/i, "token=***");
+    await validateMediaUrl(mediaUrl, f.name);
 
-if (!mediaUrl || !mediaUrl.startsWith("https://")) {
-  throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${f.name} | id=${f.id}`);
-}
-
-const head = await axios.head(mediaUrl).catch(err => err.response);
-const ct = head?.headers?.["content-type"] || "";
-const status = head?.status;
-
-console.log("[MEDIA-HEAD]", status, ct, safeUrl, f.name);
-
-if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
-  throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
-}
-    
     const childCreationId = await igCreateMediaContainer({
       igUserId: cfg.igUserId,
       pageToken: cfg.pageToken,
-      imageUrl: isVideo ? null : driveDirectDownloadUrl(f.id),
-      videoUrl: isVideo ? driveDirectDownloadUrl(f.id) : null,
+      imageUrl: isVideo ? null : mediaUrl,
+      videoUrl: isVideo ? mediaUrl : null,
       caption: null,
       isCarouselItem: true
     });
+
     if (isVideo) {
       await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
     }
+
     childrenIds.push(childCreationId);
   }
 
@@ -189,8 +200,6 @@ async function tick({ client, sheets, drive }) {
       const mediaFiles = await listMediaFiles(drive, job.folder_id);
 
       const { mediaId, permalink } = await publishJob({
-        client,
-        channelId: job.channel_id,
         shopKey: job.shop,
         caption,
         mediaFiles
@@ -201,7 +210,13 @@ async function tick({ client, sheets, drive }) {
       await updateRow(sheets, {
         queueSheetId: QUEUE_SHEET_ID,
         rowNum: job.rowNum,
-        patch: { status: "SUCCESS", attempts: job.attempts + 1, ig_media_id: mediaId, ig_permalink: permalink, published_at: publishedAt }
+        patch: {
+          status: "SUCCESS",
+          attempts: job.attempts + 1,
+          ig_media_id: mediaId,
+          ig_permalink: permalink,
+          published_at: publishedAt
+        }
       });
 
       if (channel) {
@@ -209,6 +224,7 @@ async function tick({ client, sheets, drive }) {
       }
     } catch (e) {
       const msg = (e.response?.data && JSON.stringify(e.response.data)) ? JSON.stringify(e.response.data) : (e.message || String(e));
+
       await updateRow(sheets, {
         queueSheetId: QUEUE_SHEET_ID,
         rowNum: job.rowNum,
@@ -224,24 +240,23 @@ async function tick({ client, sheets, drive }) {
 
 async function main() {
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
   const { sheets, drive } = await getClients();
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
-    
-// Start media proxy server (Railway requires PORT) - ONLY ONCE
-if (!global.__MEDIA_PROXY_STARTED__) {
-  global.__MEDIA_PROXY_STARTED__ = true;
 
-  const handler = createMediaHandler({ drive });
-  const port = process.env.PORT || 3000;
+    // Start media proxy server (Railway requires PORT) - ONLY ONCE
+    if (!global.__MEDIA_PROXY_STARTED__) {
+      global.__MEDIA_PROXY_STARTED__ = true;
 
-  http.createServer((req, res) => handler(req, res)).listen(port, () => {
-    console.log(`🌐 Media proxy listening on :${port}`);
-  });
-}
-    // Worker tick mỗi 60s (Railway Cron không hợp vì cron service phải exit, và min 5 phút). :contentReference[oaicite:16]{index=16}
+      const handler = createMediaHandler({ drive });
+      const port = process.env.PORT || 3000;
+
+      http.createServer((req, res) => handler(req, res)).listen(port, () => {
+        console.log(`🌐 Media proxy listening on :${port}`);
+      });
+    }
+
     setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
     tick({ client, sheets, drive }).catch(console.error);
   });
