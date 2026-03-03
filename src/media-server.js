@@ -1,62 +1,95 @@
 // src/media-server.js
-const express = require("express");
+const { URL } = require("url");
 const { mustEnv } = require("./utils");
 
-function createMediaServer({ drive }) {
-  const app = express();
-
+function createMediaHandler({ drive }) {
   const token = mustEnv("MEDIA_PROXY_TOKEN");
 
-  app.get("/health", (req, res) => res.status(200).send("ok"));
-
-  // Public URL for Meta to fetch:
-  // GET /media/:fileId?token=...
-  app.get("/media/:fileId", async (req, res) => {
+  return async (req, res) => {
     try {
-      if (req.query.token !== token) {
-        return res.status(403).send("forbidden");
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.statusCode = 405;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.end("method not allowed");
       }
 
-      const fileId = req.params.fileId;
+      const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-      // Get metadata for mimeType + name
+      // Health check
+      if (u.pathname === "/health") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.end("ok");
+      }
+
+      // /media/<fileId>
+      const m = u.pathname.match(/^\/media\/([a-zA-Z0-9_-]+)$/);
+      if (!m) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.end("not found");
+      }
+
+      // Token guard
+      if (u.searchParams.get("token") !== token) {
+        res.statusCode = 403;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.end("forbidden");
+      }
+
+      const fileId = m[1];
+
+      // 1) Get metadata
       const meta = await drive.files.get({
         fileId,
         fields: "id,name,mimeType,size",
         supportsAllDrives: true,
       });
 
-      const { name, mimeType } = meta.data || {};
+      const { mimeType, size } = meta.data || {};
       if (!mimeType || (!mimeType.startsWith("image/") && !mimeType.startsWith("video/"))) {
-        return res.status(415).send("unsupported media type");
+        res.statusCode = 415;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.end("unsupported media type");
       }
 
-      res.setHeader("Content-Type", mimeType);
-      res.setHeader("Content-Disposition", `inline; filename="${name || fileId}"`);
-      // Cache a bit so Meta can retry without re-pulling from Drive every time
-      res.setHeader("Cache-Control", "public, max-age=3600");
+      // 2) HEAD request: return headers only (no stream)
+      if (req.method === "HEAD") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", mimeType);
+        if (size) res.setHeader("Content-Length", String(size));
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        return res.end();
+      }
 
-      // Stream file bytes from Drive using alt=media :contentReference[oaicite:2]{index=2}
+      // 3) Open stream from Drive
       const file = await drive.files.get(
         { fileId, alt: "media", supportsAllDrives: true },
         { responseType: "stream" }
       );
 
+      // 4) Set correct headers (NO Content-Disposition to avoid invalid chars)
+      res.statusCode = 200;
+      res.setHeader("Content-Type", mimeType);
+      if (size) res.setHeader("Content-Length", String(size));
+      res.setHeader("Cache-Control", "public, max-age=3600");
+
       file.data.on("error", (e) => {
         console.error("Drive stream error:", e);
-        if (!res.headersSent) res.status(502);
-        res.end();
+        try { res.destroy(e); } catch {}
       });
 
       file.data.pipe(res);
     } catch (e) {
       const status = e?.response?.status || 500;
-      console.error("media proxy error:", status, e?.message || e);
-      res.status(status === 404 ? 404 : 500).send("error");
-    }
-  });
+      const details = e?.response?.data ? JSON.stringify(e.response.data) : (e.message || String(e));
+      console.error("MEDIA proxy error:", status, details);
 
-  return app;
+      res.statusCode = status === 404 ? 404 : 500;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end("error");
+    }
+  };
 }
 
-module.exports = { createMediaServer };
+module.exports = { createMediaHandler };
