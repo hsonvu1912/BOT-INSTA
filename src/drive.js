@@ -45,8 +45,16 @@ async function listMediaFiles(drive, folderId) {
 }
 
 function driveDirectDownloadUrl(fileId) {
-  // Cách A: relies on public sharing.
-  return `https://drive.google.com/uc?export=download&id=${fileId}`;
+  const base = process.env.PUBLIC_BASE_URL;
+  const token = process.env.MEDIA_PROXY_TOKEN;
+
+  // Bắt buộc phải có, để không “rụng” về Drive nữa
+  if (!base || !token) {
+    throw new Error("Missing PUBLIC_BASE_URL or MEDIA_PROXY_TOKEN (Option C required)");
+  }
+
+  const cleanBase = base.replace(/\/$/, "");
+  return `${cleanBase}/media/${fileId}?token=${encodeURIComponent(token)}`;
 }
 
 function deriveSkuFromFolderName(folderName) {
