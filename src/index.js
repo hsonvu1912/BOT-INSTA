@@ -1,3 +1,5 @@
+const http = require("http");
+const { createMediaHandler } = require("./media-server");
 const { Client, GatewayIntentBits } = require("discord.js");
 const { DateTime } = require("luxon");
 
@@ -188,7 +190,18 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
+    
+// Start media proxy server (Railway requires PORT)
+if (!global.__MEDIA_PROXY_STARTED__) {
+  global.__MEDIA_PROXY_STARTED__ = true;
 
+  const handler = createMediaHandler({ drive });
+  const port = process.env.PORT || 3000;
+
+  http.createServer((req, res) => handler(req, res)).listen(port, () => {
+    console.log(`🌐 Media proxy listening on :${port}`);
+  });
+}
         // Start media proxy server (Railway requires PORT)
     if (!mediaServerStarted) {
   mediaServerStarted = true;
