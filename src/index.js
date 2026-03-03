@@ -3,6 +3,9 @@ const { DateTime } = require("luxon");
 
 const { mustEnv } = require("./utils");
 const { getClients } = require("./google");
+const { createMediaServer } = require("./media-server");
+
+let mediaServerStarted = false;
 const { parseFolderIdFromUrl, getFolderName, deriveSkuFromFolderName, listMediaFiles, driveDirectDownloadUrl } = require("./drive");
 const { parseVnDatetime, appendJob, fetchAllJobs, updateRow, nowVn } = require("./queue");
 const { igCreateMediaContainer, igCreateCarouselContainer, igPublish, igGetPermalink, waitUntilFinished } = require("./ig");
@@ -185,6 +188,18 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
+
+        // Start media proxy server (Railway requires PORT)
+    if (!mediaServerStarted) {
+  mediaServerStarted = true;
+
+  const app = createMediaServer({ drive });
+  const port = process.env.PORT || 3000;
+
+  app.listen(port, () => {
+    console.log(`🌐 Media proxy listening on :${port}`);
+  });
+}
 
     // Worker tick mỗi 60s (Railway Cron không hợp vì cron service phải exit, và min 5 phút). :contentReference[oaicite:16]{index=16}
     setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
