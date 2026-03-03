@@ -1,3 +1,4 @@
+const axios = require("axios");
 const http = require("http");
 const { createMediaHandler } = require("./media-server");
 const { Client, GatewayIntentBits } = require("discord.js");
