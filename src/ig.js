@@ -1,7 +1,7 @@
 const axios = require("axios");
 const { mustEnv } = require("./utils");
 
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0"; // latest noted in changelog :contentReference[oaicite:12]{index=12}
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
 async function igCreateMediaContainer({ igUserId, pageToken, imageUrl, videoUrl, caption, isCarouselItem }) {
@@ -18,7 +18,6 @@ async function igCreateMediaContainer({ igUserId, pageToken, imageUrl, videoUrl,
 }
 
 async function igGetContainerStatus({ creationId, pageToken }) {
-  // Official reference mentions status_code for video readiness (FINISHED). :contentReference[oaicite:13]{index=13}
   const url = `${BASE}/${creationId}`;
   const r = await axios.get(url, {
     params: { fields: "status_code,status", access_token: pageToken }
@@ -26,18 +25,21 @@ async function igGetContainerStatus({ creationId, pageToken }) {
   return r.data;
 }
 
-async function waitUntilFinished({ creationId, pageToken, timeoutMs = 5 * 60 * 1000 }) {
+// Chờ FINISHED cho cả ảnh/video/parent carousel (không chỉ video)
+async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000 }) {
   const started = Date.now();
+
   while (true) {
     const st = await igGetContainerStatus({ creationId, pageToken });
-    const code = st.status_code;
+    const code = st.status_code || st.status; // fallback
 
     if (code === "FINISHED") return;
     if (code === "ERROR") throw new Error(`IG container ERROR: ${JSON.stringify(st)}`);
 
     if (Date.now() - started > timeoutMs) {
-      throw new Error("Timeout chờ IG container FINISHED");
+      throw new Error(`Timeout chờ IG container FINISHED: ${creationId} | ${JSON.stringify(st)}`);
     }
+
     await new Promise(res => setTimeout(res, 5000));
   }
 }
@@ -55,7 +57,6 @@ async function igCreateCarouselContainer({ igUserId, pageToken, childrenIds, cap
 }
 
 async function igPublish({ igUserId, pageToken, creationId }) {
-  // Media publish edge reference :contentReference[oaicite:14]{index=14}
   const params = new URLSearchParams();
   params.set("creation_id", creationId);
   params.set("access_token", pageToken);
@@ -63,6 +64,26 @@ async function igPublish({ igUserId, pageToken, creationId }) {
   const url = `${BASE}/${igUserId}/media_publish`;
   const r = await axios.post(url, params);
   return r.data.id; // published media id
+}
+
+// Retry publish nếu gặp 9007/2207027 (media chưa sẵn sàng)
+async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 6, delayMs = 8000 }) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await igPublish({ igUserId, pageToken, creationId });
+    } catch (e) {
+      const err = e?.response?.data?.error;
+      const code = err?.code;
+      const sub = err?.error_subcode;
+
+      if (code === 9007 && sub === 2207027 && i < retries) {
+        console.log(`[IG] Media not ready (9007/2207027). Retry publish in ${delayMs}ms (attempt ${i + 1}/${retries})`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 async function igGetPermalink({ mediaId, pageToken }) {
@@ -77,6 +98,7 @@ module.exports = {
   igCreateMediaContainer,
   igCreateCarouselContainer,
   igPublish,
+  igPublishWithRetry,
   igGetPermalink,
   waitUntilFinished
 };
