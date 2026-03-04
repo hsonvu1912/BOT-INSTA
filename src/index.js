@@ -28,7 +28,7 @@ const {
 const {
   igCreateMediaContainer,
   igCreateCarouselContainer,
-  igPublish,
+  igPublishWithRetry,
   igGetPermalink,
   waitUntilFinished
 } = require("./ig");
@@ -60,31 +60,97 @@ const SHOP = {
   }
 };
 
-async function getFirstSheetTitle(sheets, spreadsheetId) {
-  const meta = await sheets.spreadsheets.get({ spreadsheetId });
-  const first = meta.data.sheets?.[0]?.properties?.title;
-  if (!first) throw new Error("Không lấy được tên tab trong Google Sheet");
-  return first;
+// ===== Multi-tab SKU lookup (no monthly variable changes) =====
+const TAB_CACHE_TTL_MS = 10 * 60 * 1000; // 10 phút
+const tabCache = new Map(); // sheetId -> { ts, titles[] }
+
+function canonSku(s) {
+  return String(s ?? "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // bỏ dấu
+    .replace(/[đĐ]/g, (m) => (m === "đ" ? "d" : "D"))
+    .replace(/[^A-Za-z0-9]/g, "")
+    .toUpperCase();
+}
+
+function tabIsLikelyInventory(title) {
+  const t = String(title || "").trim();
+  const up = t.toUpperCase();
+
+  // Bỏ qua các tab hệ thống hay gặp
+  const denyExact = new Set(["QUEUE", "DASHBOARD", "CONFIG", "README", "LOG", "SETTING", "SETTINGS"]);
+  if (denyExact.has(up)) return false;
+
+  // Tab bắt đầu "_" coi như system
+  if (t.startsWith("_")) return false;
+
+  return true;
+}
+
+function sortTabsNewestFirst(titles) {
+  // Nếu tab đặt tên kiểu "2026-03", "2026-02"… thì sort numeric sẽ ra mới -> cũ
+  return [...titles].sort((a, b) => b.localeCompare(a, "en", { numeric: true, sensitivity: "base" }));
+}
+
+async function getTabTitles(sheets, spreadsheetId) {
+  const cached = tabCache.get(spreadsheetId);
+  if (cached && Date.now() - cached.ts < TAB_CACHE_TTL_MS) return cached.titles;
+
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title))"
+  });
+
+  const titles = (meta.data.sheets || [])
+    .map(s => s.properties?.title)
+    .filter(Boolean);
+
+  tabCache.set(spreadsheetId, { ts: Date.now(), titles });
+  return titles;
 }
 
 async function findCaptionBySku({ sheets, shopKey, sku }) {
   const cfg = SHOP[shopKey];
-  const tab = cfg.sheetTab || await getFirstSheetTitle(sheets, cfg.sheetId);
+  const targetCanon = canonSku(sku);
 
-  const range = shopKey === "MAUME" ? `${tab}!E:L` : `${tab}!F:H`;
-  const r = await sheets.spreadsheets.values.get({ spreadsheetId: cfg.sheetId, range });
-  const rows = r.data.values || [];
+  // Nếu bạn muốn “ghim” tab nào đó thì set SHEET_TAB_*.
+  // Nếu không set -> quét tất cả tab.
+  const titlesAll = await getTabTitles(sheets, cfg.sheetId);
 
-  const target = String(sku).trim();
-  for (const row of rows) {
-    const code = (row[cfg.codeColIndexInRange] ?? "").toString().trim();
-    if (code === target) {
-      const caption = (row[cfg.captionColIndexInRange] ?? "").toString();
-      return caption;
+  const titles = cfg.sheetTab
+    ? [cfg.sheetTab]
+    : sortTabsNewestFirst(titlesAll.filter(tabIsLikelyInventory));
+
+  const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:H`));
+
+  // batchGet theo chunk để tránh request quá to
+  const CHUNK = 80;
+  for (let i = 0; i < ranges.length; i += CHUNK) {
+    const chunkRanges = ranges.slice(i, i + CHUNK);
+
+    const resp = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId: cfg.sheetId,
+      ranges: chunkRanges,
+      majorDimension: "ROWS"
+    });
+
+    const valueRanges = resp.data.valueRanges || [];
+    for (const vr of valueRanges) {
+      const rows = vr.values || [];
+      for (const row of rows) {
+        const codeRaw = (row[cfg.codeColIndexInRange] ?? "").toString();
+        const codeCanon = canonSku(codeRaw);
+        if (codeCanon === targetCanon) {
+          return (row[cfg.captionColIndexInRange] ?? "").toString();
+        }
+      }
     }
   }
+
   return null;
 }
+// ===== End multi-tab SKU lookup =====
 
 async function validateMediaUrl(mediaUrl, fileName) {
   const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
@@ -125,11 +191,15 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: false
     });
 
-    if (isVideo) {
-      await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
-    }
+    // FIX 9007: luôn chờ FINISHED (không chỉ video)
+    await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
 
-    const mediaId = await igPublish({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId });
+    const mediaId = await igPublishWithRetry({
+      igUserId: cfg.igUserId,
+      pageToken: cfg.pageToken,
+      creationId
+    });
+
     const permalink = await igGetPermalink({ mediaId, pageToken: cfg.pageToken });
     return { mediaId, permalink };
   }
@@ -151,9 +221,8 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: true
     });
 
-    if (isVideo) {
-      await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
-    }
+    // FIX 9007: chờ FINISHED cho từng child (kể cả ảnh)
+    await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
 
     childrenIds.push(childCreationId);
   }
@@ -165,7 +234,15 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
     caption
   });
 
-  const mediaId = await igPublish({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId: parentCreationId });
+  // FIX 9007: chờ FINISHED cho parent carousel
+  await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken });
+
+  const mediaId = await igPublishWithRetry({
+    igUserId: cfg.igUserId,
+    pageToken: cfg.pageToken,
+    creationId: parentCreationId
+  });
+
   const permalink = await igGetPermalink({ mediaId, pageToken: cfg.pageToken });
   return { mediaId, permalink };
 }
@@ -223,7 +300,9 @@ async function tick({ client, sheets, drive }) {
         await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}`);
       }
     } catch (e) {
-      const msg = (e.response?.data && JSON.stringify(e.response.data)) ? JSON.stringify(e.response.data) : (e.message || String(e));
+      const msg = (e.response?.data && JSON.stringify(e.response.data))
+        ? JSON.stringify(e.response.data)
+        : (e.message || String(e));
 
       await updateRow(sheets, {
         queueSheetId: QUEUE_SHEET_ID,
