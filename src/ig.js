@@ -9,6 +9,26 @@ function pickMediaUrls(payload) {
   return { img, vid };
 }
 
+function isImageUrlRequiredError(e) {
+  const err = e?.response?.data?.error;
+  return err?.code === 100 && typeof err?.message === "string" && err.message.includes("image_url is required");
+}
+
+function isVideoUrlRequiredError(e) {
+  const err = e?.response?.data?.error;
+  return err?.code === 100 && typeof err?.message === "string" && err.message.includes("video_url is required");
+}
+
+function isMediaFetchFail(e) {
+  const err = e?.response?.data?.error;
+  return err?.code === 9004 && err?.error_subcode === 2207052;
+}
+
+function isServerError(e) {
+  const status = e?.response?.status;
+  return status && status >= 500;
+}
+
 async function igCreateMediaContainer(payload) {
   const { igUserId, pageToken, caption, isCarouselItem, mediaType } = payload;
   const { img, vid } = pickMediaUrls(payload);
@@ -20,11 +40,12 @@ async function igCreateMediaContainer(payload) {
   const params = new URLSearchParams();
   if (caption) params.set("caption", caption);
 
-  // optional: nếu sau này bạn muốn ép reels/video type
+  // media_type chỉ set khi có (để hỗ trợ fallback)
   if (mediaType) params.set("media_type", mediaType);
 
   if (img) params.set("image_url", img);
   if (vid) params.set("video_url", vid);
+
   if (isCarouselItem) params.set("is_carousel_item", "true");
 
   params.set("access_token", pageToken);
@@ -34,29 +55,62 @@ async function igCreateMediaContainer(payload) {
   return r.data.id; // creation_id
 }
 
-// Retry create container nếu Meta báo media chưa tải được (9004/2207052) hoặc lỗi mạng tạm
+function buildVideoVariants(payload) {
+  // Meta thay đổi khá thất thường:
+  // - Single video: thường cần media_type=REELS :contentReference[oaicite:3]{index=3}
+  // - Carousel item: docs nói reels không supported, nên thử theo thứ tự: (no media_type) -> VIDEO -> REELS :contentReference[oaicite:4]{index=4}
+  const base = { ...payload };
+
+  if (payload.isCarouselItem) {
+    return [
+      { ...base, mediaType: undefined },
+      { ...base, mediaType: "VIDEO" },  // nếu Meta vẫn chấp nhận cho carousel item
+      { ...base, mediaType: "REELS" }   // last resort (có thể fail nếu Meta cứng)
+    ];
+  }
+
+  return [
+    { ...base, mediaType: "REELS" },    // chuẩn nhất cho single video :contentReference[oaicite:5]{index=5}
+    { ...base, mediaType: "VIDEO" },    // fallback (có thể bị deprecated tùy thời điểm) :contentReference[oaicite:6]{index=6}
+    { ...base, mediaType: undefined }   // last resort
+  ];
+}
+
+// Retry + fallback variants để giảm lỗi kiểu “image_url required”
 async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs = 6000 } = {}) {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      return await igCreateMediaContainer(payload);
-    } catch (e) {
-      const err = e?.response?.data?.error;
-      const code = err?.code;
-      const sub = err?.error_subcode;
-      const status = e?.response?.status;
+  const { vid } = pickMediaUrls(payload);
 
-      const isMediaFetchFail = code === 9004 && sub === 2207052;
-      const isTransientHttp = status && status >= 500;
-      const isNetwork = !status && (e.code || e.message);
+  const variants = vid ? buildVideoVariants(payload) : [payload];
 
-      if ((isMediaFetchFail || isTransientHttp || isNetwork) && i < retries) {
-        console.log(`[IG] create container retry in ${delayMs}ms (attempt ${i + 1}/${retries})`, err?.message || e.message);
-        await new Promise(r => setTimeout(r, delayMs));
-        continue;
+  let lastErr = null;
+
+  for (const v of variants) {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await igCreateMediaContainer(v);
+      } catch (e) {
+        lastErr = e;
+
+        // Nếu lỗi “image_url required” hoặc “video_url required” thường do kiểu payload không hợp lệ -> thử variant khác
+        if (isImageUrlRequiredError(e) || isVideoUrlRequiredError(e)) {
+          break;
+        }
+
+        // Media fetch fail / 5xx: retry cùng variant vì có thể Meta fetch chậm hoặc server chập
+        if ((isMediaFetchFail(e) || isServerError(e)) && i < retries) {
+          console.log(`[IG] create container retry in ${delayMs}ms (attempt ${i + 1}/${retries})`, e?.response?.data?.error?.message || e.message);
+          await new Promise(r => setTimeout(r, delayMs));
+          continue;
+        }
+
+        // Lỗi khác: ném ra luôn
+        throw e;
       }
-      throw e;
     }
   }
+
+  // Nếu đi hết variants mà vẫn fail
+  throw lastErr || new Error("Failed to create media container");
 }
 
 async function igGetContainerStatus({ creationId, pageToken }) {
@@ -67,7 +121,6 @@ async function igGetContainerStatus({ creationId, pageToken }) {
   return r.data;
 }
 
-// Chờ FINISHED cho cả ảnh/video/parent carousel
 async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000 }) {
   const started = Date.now();
 
@@ -81,6 +134,7 @@ async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 
     if (Date.now() - started > timeoutMs) {
       throw new Error(`Timeout chờ FINISHED: ${creationId} | ${JSON.stringify(st)}`);
     }
+
     await new Promise(res => setTimeout(res, 5000));
   }
 }
@@ -104,10 +158,9 @@ async function igPublish({ igUserId, pageToken, creationId }) {
 
   const url = `${BASE}/${igUserId}/media_publish`;
   const r = await axios.post(url, params);
-  return r.data.id; // published media id
+  return r.data.id;
 }
 
-// Retry publish nếu gặp 9007/2207027 (media chưa sẵn sàng)
 async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8, delayMs = 7000 }) {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -117,6 +170,7 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
       const code = err?.code;
       const sub = err?.error_subcode;
 
+      // 9007/2207027 = media chưa sẵn sàng đăng
       if (code === 9007 && sub === 2207027 && i < retries) {
         console.log(`[IG] Media not ready (9007/2207027). Retry publish in ${delayMs}ms (attempt ${i + 1}/${retries})`);
         await new Promise(r => setTimeout(r, delayMs));
