@@ -338,7 +338,8 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
-
+    startDailyTokenReminder(client);
+    
     if (!global.__MEDIA_PROXY_STARTED__) {
       global.__MEDIA_PROXY_STARTED__ = true;
 
