@@ -61,7 +61,7 @@ const SHOP = {
 
 // ===== Multi-tab SKU lookup (no monthly variable changes) =====
 const TAB_CACHE_TTL_MS = 10 * 60 * 1000;
-const tabCache = new Map(); // sheetId -> { ts, titles[] }
+const tabCache = new Map();
 
 function canonSku(s) {
   return String(s ?? "")
@@ -95,10 +95,7 @@ async function getTabTitles(sheets, spreadsheetId) {
     fields: "sheets(properties(title))"
   });
 
-  const titles = (meta.data.sheets || [])
-    .map(s => s.properties?.title)
-    .filter(Boolean);
-
+  const titles = (meta.data.sheets || []).map(s => s.properties?.title).filter(Boolean);
   tabCache.set(spreadsheetId, { ts: Date.now(), titles });
   return titles;
 }
@@ -108,9 +105,7 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   const targetCanon = canonSku(sku);
 
   const allTitles = await getTabTitles(sheets, cfg.sheetId);
-  const titles = cfg.sheetTab
-    ? [cfg.sheetTab]
-    : sortTabsNewestFirst(allTitles.filter(tabIsLikelyInventory));
+  const titles = cfg.sheetTab ? [cfg.sheetTab] : sortTabsNewestFirst(allTitles.filter(tabIsLikelyInventory));
 
   const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:H`));
 
@@ -145,7 +140,7 @@ function isVideoName(name) {
   return /\.mp4$/i.test(name || "");
 }
 
-// Ưu tiên mp4 lên đầu nếu có (bắt buộc)
+// Nếu folder có mp4: bắt buộc mp4 đứng đầu
 function prioritizeVideosFirst(mediaFiles) {
   const videos = [];
   const images = [];
@@ -156,7 +151,7 @@ function prioritizeVideosFirst(mediaFiles) {
   return videos.length ? [...videos, ...images] : mediaFiles;
 }
 
-// Validate media URL: HEAD trước, nếu HEAD fail thì GET Range
+// Validate media URL: HEAD trước, fail thì GET Range
 async function validateMediaUrl(mediaUrl, fileName) {
   const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
 
@@ -164,18 +159,13 @@ async function validateMediaUrl(mediaUrl, fileName) {
     throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${fileName}`);
   }
 
-  // 1) HEAD
   const headResp = await axios.head(mediaUrl, { timeout: 15000 }).catch(err => err.response);
   const headStatus = headResp?.status;
   const headCt = headResp?.headers?.["content-type"] || "";
-
   console.log("[MEDIA-HEAD]", headStatus, headCt, safeUrl, fileName);
 
-  if (headStatus === 200 && (headCt.startsWith("image/") || headCt.startsWith("video/"))) {
-    return;
-  }
+  if (headStatus === 200 && (headCt.startsWith("image/") || headCt.startsWith("video/"))) return;
 
-  // 2) Fallback GET range
   const getResp = await axios.get(mediaUrl, {
     timeout: 20000,
     responseType: "arraybuffer",
@@ -187,21 +177,16 @@ async function validateMediaUrl(mediaUrl, fileName) {
   const ct = getResp.headers?.["content-type"] || "";
   console.log("[MEDIA-GET]", st, ct, safeUrl, fileName);
 
-  // 200 (no range support) hoặc 206 (partial content) đều ok
-  if ((st === 200 || st === 206) && (ct.startsWith("image/") || ct.startsWith("video/"))) {
-    return;
-  }
+  if ((st === 200 || st === 206) && (ct.startsWith("image/") || ct.startsWith("video/"))) return;
 
   throw new Error(`MEDIA URL not serving media: status=${st} ct=${ct} url=${safeUrl}`);
 }
 
 async function publishJob({ shopKey, caption, mediaFiles }) {
   const cfg = SHOP[shopKey];
-
-  // Ưu tiên mp4 lên đầu nếu có
   const ordered = prioritizeVideosFirst(mediaFiles);
 
-  // Single media
+  // Single
   if (ordered.length === 1) {
     const f = ordered[0];
     const isVideo = isVideoName(f.name);
@@ -218,7 +203,6 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: false
     });
 
-    // FIX 9007: luôn chờ FINISHED
     await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
 
     const mediaId = await igPublishWithRetry({
@@ -231,9 +215,8 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
     return { mediaId, permalink };
   }
 
-  // Carousel (<=10)
+  // Carousel
   const childrenIds = [];
-
   for (const f of ordered) {
     const isVideo = isVideoName(f.name);
 
@@ -249,9 +232,7 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: true
     });
 
-    // FIX 9007: chờ FINISHED cho từng child (kể cả ảnh)
     await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
-
     childrenIds.push(childCreationId);
   }
 
@@ -262,7 +243,6 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
     caption
   });
 
-  // FIX 9007: chờ FINISHED cho parent carousel
   await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken });
 
   const mediaId = await igPublishWithRetry({
@@ -352,7 +332,6 @@ async function main() {
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // Start media proxy server (Railway requires PORT) - ONLY ONCE
     if (!global.__MEDIA_PROXY_STARTED__) {
       global.__MEDIA_PROXY_STARTED__ = true;
 
@@ -410,8 +389,7 @@ async function main() {
         `✅ Đã tạo lịch\n- Shop: **${SHOP[shopKey].name}**\n- Giờ đăng (VN): **${dt.toFormat("yyyy-MM-dd HH:mm")}**\n- SKU: **${sku}**\n- Media: **${mediaFiles.length}** file (<=10)\n- Folder: ${folderUrl}`
       );
     } catch (e) {
-      const msg = (e.message || String(e));
-      await interaction.editReply(`❌ Tạo lịch thất bại: ${msg}`);
+      await interaction.editReply(`❌ Tạo lịch thất bại: ${e.message || String(e)}`);
     }
   });
 
