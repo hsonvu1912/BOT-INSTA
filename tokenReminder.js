@@ -1,16 +1,9 @@
 /* =========================
-   tokenReminder.js (ROOT)
-   - Check token 12h/lần và LUÔN gửi report lên channel đã set
-   - Slash command: /testtoken (check ngay, gửi report lên channel + reply ephemeral)
-   - Không đổi variables:
-     FB_PAGE_TOKEN_MAUME, FB_PAGE_TOKEN_BURGER
-     FB_APP_ID, FB_APP_SECRET (hoặc META_APP_ID/META_APP_SECRET, APP_ID/APP_SECRET)
-     DISCORD_ALERT_CHANNEL_ID (hoặc DISCORD_LOG_CHANNEL_ID, LOG_CHANNEL_ID, REPORT_CHANNEL_ID)
+   (A) REPLACE FILE: tokenReminder.js
    ========================= */
-
 const https = require("https");
 
-const H12_MS = 12 * 60 * 60 * 1000; // 12h
+const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12h
 const WARN_DAYS = 7;
 const TZ = "Asia/Ho_Chi_Minh";
 
@@ -19,17 +12,17 @@ function env(name, fallback = "") {
   return v && String(v).trim() ? String(v).trim() : fallback;
 }
 
-function previewToken(t) {
-  if (!t || typeof t !== "string") return "(no-token)";
-  return `${t.slice(0, 6)}…${t.slice(-4)}`;
-}
-
 function nowVN() {
   try {
     return new Date().toLocaleString("vi-VN", { timeZone: TZ });
   } catch {
     return new Date().toISOString();
   }
+}
+
+function previewToken(t) {
+  if (!t || typeof t !== "string") return "(no-token)";
+  return `${t.slice(0, 6)}…${t.slice(-4)}`;
 }
 
 function httpsGetJson(url) {
@@ -100,6 +93,7 @@ async function sendToDiscord(client, message) {
 }
 
 function collectShopTokens() {
+  // giữ nguyên variables bạn đang dùng
   const maume = env("FB_PAGE_TOKEN_MAUME");
   const burger = env("FB_PAGE_TOKEN_BURGER");
 
@@ -115,7 +109,7 @@ function getAppCreds() {
   return { appId, appSecret };
 }
 
-function buildReport({ mode, results, warnings }) {
+function buildReport({ mode, results, notes }) {
   const header = `🧾 **Token check (${mode})** • ${nowVN()} (VN)`;
 
   const lines = results.map((r) => {
@@ -135,36 +129,28 @@ function buildReport({ mode, results, warnings }) {
     )}** • còn **${r.daysLeft} ngày**${warn}`;
   });
 
-  const warnBlock = warnings.length
-    ? `\n\n⚠️ **Ghi chú:**\n${warnings.map((w) => `- ${w}`).join("\n")}`
-    : "";
+  const noteBlock = notes.length ? `\n\n📝 **Ghi chú:**\n${notes.map((n) => `- ${n}`).join("\n")}` : "";
 
-  return `${header}\n${lines.join("\n")}${warnBlock}`;
+  return `${header}\n${lines.join("\n")}${noteBlock}`;
 }
 
 /**
- * Core: check tokens và (tuỳ chọn) gửi report lên Discord channel
- * @param {object} client Discord client
- * @param {object} opts { mode: "auto" | "manual", postToChannel: boolean }
- * @returns {Promise<{report: string, okPost: boolean, results: any[]}>}
+ * Check tokens + ALWAYS post report to channel (the user asked for it)
  */
-async function checkTokens(client, opts = {}) {
-  const mode = opts.mode || "auto";
-  const postToChannel = opts.postToChannel !== false; // default true
-
-  const warnings = [];
+async function checkTokensAndReport(client, mode = "auto") {
+  const notes = [];
   const { appId, appSecret } = getAppCreds();
 
   if (!appId || !appSecret) {
     const report =
       "⚠️ Thiếu FB_APP_ID / FB_APP_SECRET (hoặc META_APP_ID/META_APP_SECRET). Không debug token được.";
-    const okPost = postToChannel ? await sendToDiscord(client, report) : false;
-    return { report, okPost, results: [] };
+    const okPost = await sendToDiscord(client, report);
+    return { report, okPost };
   }
 
   const tokens = collectShopTokens();
   if (tokens.length < 2) {
-    warnings.push(
+    notes.push(
       `Bot chỉ thấy **${tokens.length}/2** token shop. Cần có đủ: FB_PAGE_TOKEN_MAUME và FB_PAGE_TOKEN_BURGER.`
     );
   }
@@ -174,11 +160,10 @@ async function checkTokens(client, opts = {}) {
 
   for (const it of tokens) {
     const name = it.name;
-    const tok = it.token;
-    const prev = previewToken(tok);
+    const prev = previewToken(it.token);
 
     try {
-      const data = await debugToken(tok, appAccessToken);
+      const data = await debugToken(it.token, appAccessToken);
       const isValid = !!data?.is_valid;
       const expiresAt = Number(data?.expires_at || 0);
 
@@ -198,55 +183,42 @@ async function checkTokens(client, opts = {}) {
     }
   }
 
-  // Nếu vì lý do nào đó tokens rỗng, vẫn report để bạn biết bot đang làm gì
   if (results.length === 0) {
-    results.push({
-      name: "Tokens",
-      preview: "(none)",
-      status: "ERROR",
-      error: "Không tìm thấy token để check",
-    });
+    results.push({ name: "Tokens", preview: "(none)", status: "ERROR", error: "Không tìm thấy token để check" });
   }
 
-  const report = buildReport({ mode, results, warnings });
-  const okPost = postToChannel ? await sendToDiscord(client, report) : false;
-  return { report, okPost, results };
+  const report = buildReport({ mode, results, notes });
+  const okPost = await sendToDiscord(client, report);
+  return { report, okPost };
 }
 
-/* =========================
-   12h scheduler
-   ========================= */
-let _intervalId = null;
+/* ===== Scheduler 12h ===== */
+let _interval = null;
 
 function startTokenReminder(client) {
-  // chạy ngay khi bot ready
-  checkTokens(client, { mode: "auto", postToChannel: true }).catch(() => {});
+  // chạy ngay + luôn report
+  checkTokensAndReport(client, "auto").catch(() => {});
 
-  // rồi mỗi 12h chạy lại
-  if (_intervalId) clearInterval(_intervalId);
-  _intervalId = setInterval(() => {
-    checkTokens(client, { mode: "auto", postToChannel: true }).catch(() => {});
-  }, H12_MS);
+  // 12h/lần + luôn report
+  if (_interval) clearInterval(_interval);
+  _interval = setInterval(() => {
+    checkTokensAndReport(client, "auto").catch(() => {});
+  }, CHECK_INTERVAL_MS);
 
-  console.log("[tokenReminder] enabled: check every 12 hours + always post to channel");
+  console.log("[tokenReminder] enabled: check every 12 hours + always post report");
 }
 
-/* =========================
-   Slash: /testtoken
-   - tự register (global hoặc guild nếu có DISCORD_GUILD_ID/GUILD_ID)
-   - handle interaction
-   ========================= */
+/* ===== Slash command: /testtoken ===== */
 async function registerTestTokenCommand(client) {
   const cmd = {
     name: "testtoken",
-    description: "Kiểm tra token MauMe/Burger ngay lập tức và gửi report lên kênh log.",
+    description: "Check token MauMe/Burger ngay và gửi report lên kênh log.",
   };
 
-  // Đợi client.application sẵn sàng
-  if (!client.application) await client.application?.fetch?.().catch(() => {});
-
-  const guildId = env("DISCORD_GUILD_ID") || env("GUILD_ID"); // không bắt buộc, không đổi biến
   try {
+    if (!client.application) await client.application?.fetch?.().catch(() => {});
+    const guildId = env("DISCORD_GUILD_ID") || env("GUILD_ID"); // optional, không bắt buộc đổi biến
+
     if (guildId) {
       const guild = await client.guilds.fetch(guildId);
       const existing = await guild.commands.fetch().catch(() => null);
@@ -261,53 +233,47 @@ async function registerTestTokenCommand(client) {
     await client.application.commands.create(cmd);
     console.log("[tokenReminder] /testtoken registered (global, may take time to appear)");
   } catch (e) {
-    console.log("[tokenReminder] register command failed:", e?.message || e);
+    console.log("[tokenReminder] register /testtoken failed:", e?.message || e);
   }
 }
 
 async function handleTestTokenSlash(interaction, client) {
-  try {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== "testtoken") return;
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "testtoken") return;
 
-    // phản hồi nhanh để Discord khỏi timeout
-    await interaction.reply({ content: "🔎 Đang check token và gửi report lên kênh log...", ephemeral: true });
+  await interaction.reply({ content: "🔎 Đang check token và gửi report lên kênh log...", ephemeral: true });
 
-    const { okPost } = await checkTokens(client, { mode: "manual", postToChannel: true });
+  const { okPost } = await checkTokensAndReport(client, "manual");
 
-    if (okPost) {
-      await interaction.editReply("✅ Xong. Report đã gửi lên kênh log đã cấu hình.");
-    } else {
-      await interaction.editReply(
-        "✅ Xong. Nhưng bot không gửi được vào channel (không fetch được channelId hoặc thiếu quyền). Xem Railway logs để biết chi tiết."
-      );
-    }
-  } catch (e) {
-    // Nếu reply fail thì cố gắng báo qua channel/log
-    const msg = `⚠️ /testtoken lỗi: \`${e?.message || e}\``;
-    await sendToDiscord(client, msg).catch(() => {});
-    try {
-      if (!interaction.replied) await interaction.reply({ content: msg, ephemeral: true });
-      else await interaction.editReply(msg);
-    } catch {}
+  if (okPost) {
+    await interaction.editReply("✅ Xong. Report đã gửi lên kênh log đã cấu hình.");
+  } else {
+    await interaction.editReply(
+      "✅ Xong. Nhưng bot không gửi được vào channel (sai channelId hoặc thiếu quyền). Xem Railway logs để biết chi tiết."
+    );
   }
 }
 
-module.exports = {
-  startTokenReminder,
-  registerTestTokenCommand,
-  handleTestTokenSlash,
-  // export thêm nếu bạn muốn dùng nơi khác
-  checkTokens,
-};
+module.exports = { startTokenReminder, registerTestTokenCommand, handleTestTokenSlash };
+
 
 /* =========================
-   PATCH: dán vào FILE MAIN (index.js / bot.js / src/bot.js)
-   (Bạn đã nói variables đúng, nên chỉ cần dán đúng chỗ là chạy.)
+   (B) PATCH index.js
+   - Replace the old startDailyTokenReminder require block
+   - Patch ready + interactionCreate
    ========================= */
 
 /*
-1) Ở đầu file main (dưới các require/import khác):
+1) Ở đầu index.js: THAY block này:
+
+let startDailyTokenReminder;
+try {
+  ({ startDailyTokenReminder } = require("./tokenReminder"));
+} catch {
+  ({ startDailyTokenReminder } = require("../tokenReminder"));
+}
+
+BẰNG block này:
 
 let tokenReminder;
 try {
@@ -317,19 +283,25 @@ try {
 }
 const { startTokenReminder, registerTestTokenCommand, handleTestTokenSlash } = tokenReminder;
 
-2) Trong client.once("ready", ...) hoặc client.on("ready", ...) thêm:
+2) Trong client.on("ready", ...) THAY dòng:
+startDailyTokenReminder(client);
 
-client.once("ready", async () => {
-  console.log("Bot ready");
-  startTokenReminder(client);                 // check 12h/lần + luôn post report
-  registerTestTokenCommand(client);           // tự tạo /testtoken (guild nếu có DISCORD_GUILD_ID/GUILD_ID)
-});
+BẰNG:
+startTokenReminder(client);
+registerTestTokenCommand(client);
 
-3) Trong interactionCreate (nếu bạn đã có rồi thì chỉ thêm IF này vào trong đó, đừng tạo handler mới):
+3) Trong client.on("interactionCreate", ...) sửa đầu handler thành:
 
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isChatInputCommand() && interaction.commandName === "testtoken") {
-    await handleTestTokenSlash(interaction, client);
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === "testtoken") {
+    return handleTestTokenSlash(interaction, client);
   }
+
+  if (interaction.commandName !== "ig_schedule") return;
+
+  ... phần ig_schedule giữ nguyên ...
 });
+
 */
