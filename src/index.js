@@ -1,4 +1,3 @@
-// src/index.js
 const axios = require("axios");
 const http = require("http");
 
@@ -26,7 +25,7 @@ const {
 } = require("./queue");
 
 const {
-  igCreateMediaContainer,
+  igCreateMediaContainerWithRetry,
   igCreateCarouselContainer,
   igPublishWithRetry,
   igGetPermalink,
@@ -36,7 +35,7 @@ const {
 const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
 
-// Shop config
+// ===== Shop config =====
 const SHOP = {
   MAUME: {
     name: "Màu mè",
@@ -45,8 +44,8 @@ const SHOP = {
     sheetId: mustEnv("SHEET_ID_MAUME"),
     sheetTab: process.env.SHEET_TAB_MAUME || null,
     // MauMe: caption col E, code col L -> range E:L
-    captionColIndexInRange: 0, // E in E:L
-    codeColIndexInRange: 7     // L in E:L
+    captionColIndexInRange: 0,
+    codeColIndexInRange: 7
   },
   BURGER: {
     name: "Burger",
@@ -55,20 +54,20 @@ const SHOP = {
     sheetId: mustEnv("SHEET_ID_BURGER"),
     sheetTab: process.env.SHEET_TAB_BURGER || null,
     // Burger: code col F, caption col H -> range F:H
-    captionColIndexInRange: 2, // H in F:H
-    codeColIndexInRange: 0     // F in F:H
+    captionColIndexInRange: 2,
+    codeColIndexInRange: 0
   }
 };
 
 // ===== Multi-tab SKU lookup (no monthly variable changes) =====
-const TAB_CACHE_TTL_MS = 10 * 60 * 1000; // 10 phút
+const TAB_CACHE_TTL_MS = 10 * 60 * 1000;
 const tabCache = new Map(); // sheetId -> { ts, titles[] }
 
 function canonSku(s) {
   return String(s ?? "")
     .trim()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // bỏ dấu
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[đĐ]/g, (m) => (m === "đ" ? "d" : "D"))
     .replace(/[^A-Za-z0-9]/g, "")
     .toUpperCase();
@@ -77,19 +76,13 @@ function canonSku(s) {
 function tabIsLikelyInventory(title) {
   const t = String(title || "").trim();
   const up = t.toUpperCase();
-
-  // Bỏ qua các tab hệ thống hay gặp
   const denyExact = new Set(["QUEUE", "DASHBOARD", "CONFIG", "README", "LOG", "SETTING", "SETTINGS"]);
   if (denyExact.has(up)) return false;
-
-  // Tab bắt đầu "_" coi như system
   if (t.startsWith("_")) return false;
-
   return true;
 }
 
 function sortTabsNewestFirst(titles) {
-  // Nếu tab đặt tên kiểu "2026-03", "2026-02"… thì sort numeric sẽ ra mới -> cũ
   return [...titles].sort((a, b) => b.localeCompare(a, "en", { numeric: true, sensitivity: "base" }));
 }
 
@@ -114,17 +107,13 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   const cfg = SHOP[shopKey];
   const targetCanon = canonSku(sku);
 
-  // Nếu bạn muốn “ghim” tab nào đó thì set SHEET_TAB_*.
-  // Nếu không set -> quét tất cả tab.
-  const titlesAll = await getTabTitles(sheets, cfg.sheetId);
-
+  const allTitles = await getTabTitles(sheets, cfg.sheetId);
   const titles = cfg.sheetTab
     ? [cfg.sheetTab]
-    : sortTabsNewestFirst(titlesAll.filter(tabIsLikelyInventory));
+    : sortTabsNewestFirst(allTitles.filter(tabIsLikelyInventory));
 
   const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:H`));
 
-  // batchGet theo chunk để tránh request quá to
   const CHUNK = 80;
   for (let i = 0; i < ranges.length; i += CHUNK) {
     const chunkRanges = ranges.slice(i, i + CHUNK);
@@ -152,6 +141,22 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
 }
 // ===== End multi-tab SKU lookup =====
 
+function isVideoName(name) {
+  return /\.mp4$/i.test(name || "");
+}
+
+// Ưu tiên mp4 lên đầu nếu có (bắt buộc)
+function prioritizeVideosFirst(mediaFiles) {
+  const videos = [];
+  const images = [];
+  for (const f of mediaFiles) {
+    if (isVideoName(f.name)) videos.push(f);
+    else images.push(f);
+  }
+  return videos.length ? [...videos, ...images] : mediaFiles;
+}
+
+// Validate media URL: HEAD trước, nếu HEAD fail thì GET Range
 async function validateMediaUrl(mediaUrl, fileName) {
   const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
 
@@ -159,30 +164,52 @@ async function validateMediaUrl(mediaUrl, fileName) {
     throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${fileName}`);
   }
 
-  // HEAD check: đảm bảo URL trả đúng media
-  const headResp = await axios.head(mediaUrl).catch(err => err.response);
-  const status = headResp?.status;
-  const ct = headResp?.headers?.["content-type"] || "";
+  // 1) HEAD
+  const headResp = await axios.head(mediaUrl, { timeout: 15000 }).catch(err => err.response);
+  const headStatus = headResp?.status;
+  const headCt = headResp?.headers?.["content-type"] || "";
 
-  console.log("[MEDIA-HEAD]", status, ct, safeUrl, fileName);
+  console.log("[MEDIA-HEAD]", headStatus, headCt, safeUrl, fileName);
 
-  if (status !== 200 || (!ct.startsWith("image/") && !ct.startsWith("video/"))) {
-    throw new Error(`MEDIA URL not serving media: status=${status} ct=${ct} url=${safeUrl}`);
+  if (headStatus === 200 && (headCt.startsWith("image/") || headCt.startsWith("video/"))) {
+    return;
   }
+
+  // 2) Fallback GET range
+  const getResp = await axios.get(mediaUrl, {
+    timeout: 20000,
+    responseType: "arraybuffer",
+    headers: { Range: "bytes=0-1023" },
+    validateStatus: () => true
+  });
+
+  const st = getResp.status;
+  const ct = getResp.headers?.["content-type"] || "";
+  console.log("[MEDIA-GET]", st, ct, safeUrl, fileName);
+
+  // 200 (no range support) hoặc 206 (partial content) đều ok
+  if ((st === 200 || st === 206) && (ct.startsWith("image/") || ct.startsWith("video/"))) {
+    return;
+  }
+
+  throw new Error(`MEDIA URL not serving media: status=${st} ct=${ct} url=${safeUrl}`);
 }
 
 async function publishJob({ shopKey, caption, mediaFiles }) {
   const cfg = SHOP[shopKey];
 
+  // Ưu tiên mp4 lên đầu nếu có
+  const ordered = prioritizeVideosFirst(mediaFiles);
+
   // Single media
-  if (mediaFiles.length === 1) {
-    const f = mediaFiles[0];
-    const isVideo = /\.mp4$/i.test(f.name);
+  if (ordered.length === 1) {
+    const f = ordered[0];
+    const isVideo = isVideoName(f.name);
 
     const mediaUrl = driveDirectDownloadUrl(f.id);
     await validateMediaUrl(mediaUrl, f.name);
 
-    const creationId = await igCreateMediaContainer({
+    const creationId = await igCreateMediaContainerWithRetry({
       igUserId: cfg.igUserId,
       pageToken: cfg.pageToken,
       imageUrl: isVideo ? null : mediaUrl,
@@ -191,7 +218,7 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: false
     });
 
-    // FIX 9007: luôn chờ FINISHED (không chỉ video)
+    // FIX 9007: luôn chờ FINISHED
     await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
 
     const mediaId = await igPublishWithRetry({
@@ -206,13 +233,14 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
 
   // Carousel (<=10)
   const childrenIds = [];
-  for (const f of mediaFiles) {
-    const isVideo = /\.mp4$/i.test(f.name);
+
+  for (const f of ordered) {
+    const isVideo = isVideoName(f.name);
 
     const mediaUrl = driveDirectDownloadUrl(f.id);
     await validateMediaUrl(mediaUrl, f.name);
 
-    const childCreationId = await igCreateMediaContainer({
+    const childCreationId = await igCreateMediaContainerWithRetry({
       igUserId: cfg.igUserId,
       pageToken: cfg.pageToken,
       imageUrl: isVideo ? null : mediaUrl,
