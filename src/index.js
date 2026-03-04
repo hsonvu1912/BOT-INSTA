@@ -1,6 +1,13 @@
 const axios = require("axios");
 const http = require("http");
 
+let startDailyTokenReminder;
+try {
+  ({ startDailyTokenReminder } = require("./tokenReminder"));
+} catch {
+  ({ startDailyTokenReminder } = require("../tokenReminder"));
+}
+
 const { Client, GatewayIntentBits } = require("discord.js");
 const { DateTime } = require("luxon");
 
