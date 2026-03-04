@@ -1,12 +1,14 @@
 const axios = require("axios");
 const http = require("http");
 
-let startDailyTokenReminder;
+let tokenReminder;
 try {
-  ({ startDailyTokenReminder } = require("./tokenReminder"));
+  tokenReminder = require("./tokenReminder");
 } catch {
-  ({ startDailyTokenReminder } = require("../tokenReminder"));
+  tokenReminder = require("../tokenReminder");
 }
+const { startTokenReminder, registerTestTokenCommand, handleTestTokenSlash } = tokenReminder;
+
 
 const { Client, GatewayIntentBits } = require("discord.js");
 const { DateTime } = require("luxon");
@@ -338,7 +340,8 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
-    startDailyTokenReminder(client);
+    startTokenReminder(client);
+registerTestTokenCommand(client);
     
     if (!global.__MEDIA_PROXY_STARTED__) {
       global.__MEDIA_PROXY_STARTED__ = true;
@@ -356,8 +359,13 @@ async function main() {
   });
 
   client.on("interactionCreate", async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== "ig_schedule") return;
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === "testtoken") {
+    return handleTestTokenSlash(interaction, client);
+  }
+
+  if (interaction.commandName !== "ig_schedule") return;
 
     await interaction.deferReply({ ephemeral: true });
 
