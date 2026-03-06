@@ -45,13 +45,14 @@ const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
 
 // ===== Shop config =====
+// FIX #1: Xóa sheetTab để bot luôn quét TẤT CẢ tab trong sheet kho
 const SHOP = {
   MAUME: {
     name: "Màu mè",
     igUserId: mustEnv("IG_USER_ID_MAUME"),
     pageToken: mustEnv("FB_PAGE_TOKEN_MAUME"),
     sheetId: mustEnv("SHEET_ID_MAUME"),
-    sheetTab: process.env.SHEET_TAB_MAUME || null,
+    sheetTab: null,   // <-- luôn null = quét tất cả tab
     // MauMe: caption col E, code col L -> range E:L
     captionColIndexInRange: 0,
     codeColIndexInRange: 7
@@ -61,7 +62,7 @@ const SHOP = {
     igUserId: mustEnv("IG_USER_ID_BURGER"),
     pageToken: mustEnv("FB_PAGE_TOKEN_BURGER"),
     sheetId: mustEnv("SHEET_ID_BURGER"),
-    sheetTab: process.env.SHEET_TAB_BURGER || null,
+    sheetTab: null,   // <-- luôn null = quét tất cả tab
     // Burger: code col F, caption col H -> range F:H
     captionColIndexInRange: 2,
     codeColIndexInRange: 0
@@ -367,7 +368,8 @@ registerTestTokenCommand(client);
 
   if (interaction.commandName !== "ig_schedule") return;
 
-    await interaction.deferReply({ ephemeral: true });
+    // FIX #2: Bỏ ephemeral để MỌI NGƯỜI trong channel đều thấy tin nhắn bot
+    await interaction.deferReply();
 
     try {
       const shopKey = interaction.options.getString("shop", true);
