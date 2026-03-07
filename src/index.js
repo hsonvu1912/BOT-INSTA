@@ -38,22 +38,27 @@ const {
   igCreateCarouselContainer,
   igPublishWithRetry,
   igGetPermalink,
-  waitUntilFinished
+  waitUntilFinished,
+  isRateLimitError
 } = require("./ig");
 
 const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
 
+// FIX: Delay giữa các job để tránh rate-limit (30s)
+const DELAY_BETWEEN_JOBS_MS = 30000;
+
+// FIX: Delay giữa carousel children (3s)
+const DELAY_BETWEEN_CHILDREN_MS = 3000;
+
 // ===== Shop config =====
-// FIX #1: Xóa sheetTab để bot luôn quét TẤT CẢ tab trong sheet kho
 const SHOP = {
   MAUME: {
     name: "Màu mè",
     igUserId: mustEnv("IG_USER_ID_MAUME"),
     pageToken: mustEnv("FB_PAGE_TOKEN_MAUME"),
     sheetId: mustEnv("SHEET_ID_MAUME"),
-    sheetTab: null,   // <-- luôn null = quét tất cả tab
-    // MauMe: caption col E, code col L -> range E:L
+    sheetTab: null,
     captionColIndexInRange: 0,
     codeColIndexInRange: 7
   },
@@ -62,14 +67,13 @@ const SHOP = {
     igUserId: mustEnv("IG_USER_ID_BURGER"),
     pageToken: mustEnv("FB_PAGE_TOKEN_BURGER"),
     sheetId: mustEnv("SHEET_ID_BURGER"),
-    sheetTab: null,   // <-- luôn null = quét tất cả tab
-    // Burger: code col F, caption col H -> range F:H
+    sheetTab: null,
     captionColIndexInRange: 2,
     codeColIndexInRange: 0
   }
 };
 
-// ===== Multi-tab SKU lookup (no monthly variable changes) =====
+// ===== Multi-tab SKU lookup =====
 const TAB_CACHE_TTL_MS = 10 * 60 * 1000;
 const tabCache = new Map();
 
@@ -144,13 +148,11 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
 
   return null;
 }
-// ===== End multi-tab SKU lookup =====
 
 function isVideoName(name) {
   return /\.mp4$/i.test(name || "");
 }
 
-// Nếu folder có mp4: bắt buộc mp4 đứng đầu
 function prioritizeVideosFirst(mediaFiles) {
   const videos = [];
   const images = [];
@@ -161,7 +163,6 @@ function prioritizeVideosFirst(mediaFiles) {
   return videos.length ? [...videos, ...images] : mediaFiles;
 }
 
-// Validate media URL: HEAD trước, fail thì GET Range
 async function validateMediaUrl(mediaUrl, fileName) {
   const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
 
@@ -227,7 +228,8 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
 
   // Carousel
   const childrenIds = [];
-  for (const f of ordered) {
+  for (let idx = 0; idx < ordered.length; idx++) {
+    const f = ordered[idx];
     const isVideo = isVideoName(f.name);
 
     const mediaUrl = driveDirectDownloadUrl(f.id);
@@ -244,6 +246,11 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
 
     await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
     childrenIds.push(childCreationId);
+
+    // FIX: Delay giữa các children để giảm burst
+    if (idx < ordered.length - 1) {
+      await new Promise(r => setTimeout(r, DELAY_BETWEEN_CHILDREN_MS));
+    }
   }
 
   const parentCreationId = await igCreateCarouselContainer({
@@ -265,73 +272,106 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
   return { mediaId, permalink };
 }
 
+// FIX: Lock để tick() không chồng chéo khi job chạy lâu
+let tickRunning = false;
+
 async function tick({ client, sheets, drive }) {
-  const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
-  const now = nowVn();
+  if (tickRunning) {
+    console.log("[TICK] Skipped — previous tick still running");
+    return;
+  }
+  tickRunning = true;
 
-  const due = items.filter(j => {
-    if (j.status !== "PENDING") return false;
-    const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
-    if (!dt.isValid) return false;
-    return dt <= now;
-  });
+  try {
+    const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
+    const now = nowVn();
 
-  for (const job of due) {
-    const channel = await client.channels.fetch(job.channel_id).catch(() => null);
+    const due = items.filter(j => {
+      if (j.status !== "PENDING") return false;
+      const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+      if (!dt.isValid) return false;
+      return dt <= now;
+    });
 
-    try {
-      await updateRow(sheets, {
-        queueSheetId: QUEUE_SHEET_ID,
-        rowNum: job.rowNum,
-        patch: { status: "RUNNING", attempts: job.attempts + 1, last_error: "" }
-      });
+    // FIX: Xử lý tuần tự từng job, có delay giữa các job
+    for (let jobIdx = 0; jobIdx < due.length; jobIdx++) {
+      const job = due[jobIdx];
+      const channel = await client.channels.fetch(job.channel_id).catch(() => null);
 
-      const folderName = await getFolderName(drive, job.folder_id);
-      const sku = job.sku || deriveSkuFromFolderName(folderName);
+      try {
+        await updateRow(sheets, {
+          queueSheetId: QUEUE_SHEET_ID,
+          rowNum: job.rowNum,
+          patch: { status: "RUNNING", attempts: job.attempts + 1, last_error: "" }
+        });
 
-      const caption = await findCaptionBySku({ sheets, shopKey: job.shop, sku });
-      if (!caption) throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${job.shop}`);
+        const folderName = await getFolderName(drive, job.folder_id);
+        const sku = job.sku || deriveSkuFromFolderName(folderName);
 
-      const mediaFiles = await listMediaFiles(drive, job.folder_id);
+        const caption = await findCaptionBySku({ sheets, shopKey: job.shop, sku });
+        if (!caption) throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${job.shop}`);
 
-      const { mediaId, permalink } = await publishJob({
-        shopKey: job.shop,
-        caption,
-        mediaFiles
-      });
+        const mediaFiles = await listMediaFiles(drive, job.folder_id);
 
-      const publishedAt = nowVn().toISO();
+        const { mediaId, permalink } = await publishJob({
+          shopKey: job.shop,
+          caption,
+          mediaFiles
+        });
 
-      await updateRow(sheets, {
-        queueSheetId: QUEUE_SHEET_ID,
-        rowNum: job.rowNum,
-        patch: {
-          status: "SUCCESS",
-          attempts: job.attempts + 1,
-          ig_media_id: mediaId,
-          ig_permalink: permalink,
-          published_at: publishedAt
+        const publishedAt = nowVn().toISO();
+
+        await updateRow(sheets, {
+          queueSheetId: QUEUE_SHEET_ID,
+          rowNum: job.rowNum,
+          patch: {
+            status: "SUCCESS",
+            attempts: job.attempts + 1,
+            ig_media_id: mediaId,
+            ig_permalink: permalink,
+            published_at: publishedAt
+          }
+        });
+
+        if (channel) {
+          await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}`);
         }
-      });
+      } catch (e) {
+        const msg = (e.response?.data && JSON.stringify(e.response.data))
+          ? JSON.stringify(e.response.data)
+          : (e.message || String(e));
 
-      if (channel) {
-        await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}`);
+        // FIX: Nếu rate-limit, đánh dấu PENDING lại thay vì FAILED để retry lần sau
+        const isRL = isRateLimitError(e);
+        const newStatus = isRL ? "PENDING" : "FAILED";
+
+        await updateRow(sheets, {
+          queueSheetId: QUEUE_SHEET_ID,
+          rowNum: job.rowNum,
+          patch: { status: newStatus, attempts: job.attempts + 1, last_error: msg.slice(0, 5000) }
+        });
+
+        if (channel) {
+          const statusEmoji = isRL ? "⏳" : "❌";
+          const statusText = isRL ? "Rate-limit, sẽ thử lại lần sau" : "Đăng thất bại";
+          await channel.send(`${statusEmoji} ${statusText} (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1800)}\`\`\``);
+        }
+
+        // FIX: Nếu rate-limit, dừng xử lý các job còn lại trong tick này
+        if (isRL) {
+          console.log("[TICK] Rate-limited — stopping remaining jobs, will retry next tick");
+          break;
+        }
       }
-    } catch (e) {
-      const msg = (e.response?.data && JSON.stringify(e.response.data))
-        ? JSON.stringify(e.response.data)
-        : (e.message || String(e));
 
-      await updateRow(sheets, {
-        queueSheetId: QUEUE_SHEET_ID,
-        rowNum: job.rowNum,
-        patch: { status: "FAILED", attempts: job.attempts + 1, last_error: msg.slice(0, 5000) }
-      });
-
-      if (channel) {
-        await channel.send(`❌ Đăng thất bại (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1800)}\`\`\``);
+      // FIX: Delay giữa các job
+      if (jobIdx < due.length - 1) {
+        console.log(`[TICK] Waiting ${DELAY_BETWEEN_JOBS_MS / 1000}s before next job...`);
+        await new Promise(r => setTimeout(r, DELAY_BETWEEN_JOBS_MS));
       }
     }
+  } finally {
+    tickRunning = false;
   }
 }
 
@@ -341,8 +381,13 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
-    startTokenReminder(client);
-registerTestTokenCommand(client);
+
+    // FIX: Delay token check 30s sau khi start để không burst cùng lúc
+    setTimeout(() => {
+      startTokenReminder(client);
+    }, 30000);
+
+    registerTestTokenCommand(client);
     
     if (!global.__MEDIA_PROXY_STARTED__) {
       global.__MEDIA_PROXY_STARTED__ = true;
@@ -355,20 +400,20 @@ registerTestTokenCommand(client);
       });
     }
 
-    setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
+    // FIX: Tick mỗi 90s thay vì 60s
+    setInterval(() => tick({ client, sheets, drive }).catch(console.error), 90_000);
     tick({ client, sheets, drive }).catch(console.error);
   });
 
   client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+    if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === "testtoken") {
-    return handleTestTokenSlash(interaction, client);
-  }
+    if (interaction.commandName === "testtoken") {
+      return handleTestTokenSlash(interaction, client);
+    }
 
-  if (interaction.commandName !== "ig_schedule") return;
+    if (interaction.commandName !== "ig_schedule") return;
 
-    // FIX #2: Bỏ ephemeral để MỌI NGƯỜI trong channel đều thấy tin nhắn bot
     await interaction.deferReply();
 
     try {
