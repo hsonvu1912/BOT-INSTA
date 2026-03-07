@@ -29,6 +29,12 @@ function isServerError(e) {
   return status && status >= 500;
 }
 
+// ===== FIX: Detect rate-limit error =====
+function isRateLimitError(e) {
+  const err = e?.response?.data?.error;
+  return err?.code === 4 || err?.code === 32 || err?.code === 613;
+}
+
 async function igCreateMediaContainer(payload) {
   const { igUserId, pageToken, caption, isCarouselItem, mediaType } = payload;
   const { img, vid } = pickMediaUrls(payload);
@@ -40,7 +46,6 @@ async function igCreateMediaContainer(payload) {
   const params = new URLSearchParams();
   if (caption) params.set("caption", caption);
 
-  // media_type chỉ set khi có (để hỗ trợ fallback)
   if (mediaType) params.set("media_type", mediaType);
 
   if (img) params.set("image_url", img);
@@ -52,32 +57,29 @@ async function igCreateMediaContainer(payload) {
 
   const url = `${BASE}/${igUserId}/media`;
   const r = await axios.post(url, params);
-  return r.data.id; // creation_id
+  return r.data.id;
 }
 
 function buildVideoVariants(payload) {
-  // Meta thay đổi khá thất thường:
-  // - Single video: thường cần media_type=REELS :contentReference[oaicite:3]{index=3}
-  // - Carousel item: docs nói reels không supported, nên thử theo thứ tự: (no media_type) -> VIDEO -> REELS :contentReference[oaicite:4]{index=4}
   const base = { ...payload };
 
   if (payload.isCarouselItem) {
     return [
       { ...base, mediaType: undefined },
-      { ...base, mediaType: "VIDEO" },  // nếu Meta vẫn chấp nhận cho carousel item
-      { ...base, mediaType: "REELS" }   // last resort (có thể fail nếu Meta cứng)
+      { ...base, mediaType: "VIDEO" },
+      { ...base, mediaType: "REELS" }
     ];
   }
 
   return [
-    { ...base, mediaType: "REELS" },    // chuẩn nhất cho single video :contentReference[oaicite:5]{index=5}
-    { ...base, mediaType: "VIDEO" },    // fallback (có thể bị deprecated tùy thời điểm) :contentReference[oaicite:6]{index=6}
-    { ...base, mediaType: undefined }   // last resort
+    { ...base, mediaType: "REELS" },
+    { ...base, mediaType: "VIDEO" },
+    { ...base, mediaType: undefined }
   ];
 }
 
-// Retry + fallback variants để giảm lỗi kiểu “image_url required”
-async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs = 6000 } = {}) {
+// FIX: Tăng delay retry lên 15s, thêm xử lý rate-limit (chờ 60s)
+async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs = 15000 } = {}) {
   const { vid } = pickMediaUrls(payload);
 
   const variants = vid ? buildVideoVariants(payload) : [payload];
@@ -91,25 +93,29 @@ async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs =
       } catch (e) {
         lastErr = e;
 
-        // Nếu lỗi “image_url required” hoặc “video_url required” thường do kiểu payload không hợp lệ -> thử variant khác
+        // FIX: Rate limit -> chờ lâu hơn rồi retry
+        if (isRateLimitError(e) && i < retries) {
+          const waitMs = 60000 * (i + 1); // 60s, 120s, 180s
+          console.log(`[IG] Rate limit hit. Waiting ${waitMs / 1000}s before retry (attempt ${i + 1}/${retries})`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+
         if (isImageUrlRequiredError(e) || isVideoUrlRequiredError(e)) {
           break;
         }
 
-        // Media fetch fail / 5xx: retry cùng variant vì có thể Meta fetch chậm hoặc server chập
         if ((isMediaFetchFail(e) || isServerError(e)) && i < retries) {
           console.log(`[IG] create container retry in ${delayMs}ms (attempt ${i + 1}/${retries})`, e?.response?.data?.error?.message || e.message);
           await new Promise(r => setTimeout(r, delayMs));
           continue;
         }
 
-        // Lỗi khác: ném ra luôn
         throw e;
       }
     }
   }
 
-  // Nếu đi hết variants mà vẫn fail
   throw lastErr || new Error("Failed to create media container");
 }
 
@@ -121,6 +127,7 @@ async function igGetContainerStatus({ creationId, pageToken }) {
   return r.data;
 }
 
+// FIX: Poll mỗi 20s thay vì 5s để giảm API calls
 async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000 }) {
   const started = Date.now();
 
@@ -135,7 +142,8 @@ async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 
       throw new Error(`Timeout chờ FINISHED: ${creationId} | ${JSON.stringify(st)}`);
     }
 
-    await new Promise(res => setTimeout(res, 5000));
+    // FIX: 20s thay vì 5s — giảm 75% API calls cho polling
+    await new Promise(res => setTimeout(res, 20000));
   }
 }
 
@@ -148,7 +156,7 @@ async function igCreateCarouselContainer({ igUserId, pageToken, childrenIds, cap
 
   const url = `${BASE}/${igUserId}/media`;
   const r = await axios.post(url, params);
-  return r.data.id; // parent creation_id
+  return r.data.id;
 }
 
 async function igPublish({ igUserId, pageToken, creationId }) {
@@ -161,7 +169,8 @@ async function igPublish({ igUserId, pageToken, creationId }) {
   return r.data.id;
 }
 
-async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8, delayMs = 7000 }) {
+// FIX: Tăng delay publish retry lên 15s, thêm xử lý rate-limit
+async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8, delayMs = 15000 }) {
   for (let i = 0; i <= retries; i++) {
     try {
       return await igPublish({ igUserId, pageToken, creationId });
@@ -170,7 +179,14 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
       const code = err?.code;
       const sub = err?.error_subcode;
 
-      // 9007/2207027 = media chưa sẵn sàng đăng
+      // FIX: Rate limit -> chờ 60s+
+      if (isRateLimitError(e) && i < retries) {
+        const waitMs = 60000 * (i + 1);
+        console.log(`[IG] Rate limit on publish. Waiting ${waitMs / 1000}s (attempt ${i + 1}/${retries})`);
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      }
+
       if (code === 9007 && sub === 2207027 && i < retries) {
         console.log(`[IG] Media not ready (9007/2207027). Retry publish in ${delayMs}ms (attempt ${i + 1}/${retries})`);
         await new Promise(r => setTimeout(r, delayMs));
@@ -194,5 +210,6 @@ module.exports = {
   igCreateCarouselContainer,
   igPublishWithRetry,
   igGetPermalink,
-  waitUntilFinished
+  waitUntilFinished,
+  isRateLimitError
 };
