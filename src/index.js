@@ -60,7 +60,8 @@ const SHOP = {
     sheetId: mustEnv("SHEET_ID_MAUME"),
     sheetTab: null,
     captionColIndexInRange: 0,
-    codeColIndexInRange: 7
+    codeColIndexInRange: 7,
+    khoStatusCol: "B"       // Cột "tình trạng đăng bài" trong kho Màu Mè
   },
   BURGER: {
     name: "Burger",
@@ -69,7 +70,8 @@ const SHOP = {
     sheetId: mustEnv("SHEET_ID_BURGER"),
     sheetTab: null,
     captionColIndexInRange: 2,
-    codeColIndexInRange: 0
+    codeColIndexInRange: 0,
+    khoStatusCol: "D"       // Cột "tình trạng đăng bài" trong kho Burger
   }
 };
 
@@ -114,6 +116,11 @@ async function getTabTitles(sheets, spreadsheetId) {
   return titles;
 }
 
+/**
+ * Tìm caption theo SKU trong kho sheet.
+ * Trả về { caption, tabName, rowNum } hoặc null nếu không tìm thấy.
+ * tabName + rowNum dùng để cập nhật tình trạng đăng bài sau khi publish.
+ */
 async function findCaptionBySku({ sheets, shopKey, sku }) {
   const cfg = SHOP[shopKey];
   const targetCanon = canonSku(sku);
@@ -126,6 +133,7 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   const CHUNK = 80;
   for (let i = 0; i < ranges.length; i += CHUNK) {
     const chunkRanges = ranges.slice(i, i + CHUNK);
+    const chunkTitles = titles.slice(i, i + CHUNK);
 
     const resp = await sheets.spreadsheets.values.batchGet({
       spreadsheetId: cfg.sheetId,
@@ -134,19 +142,144 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
     });
 
     const valueRanges = resp.data.valueRanges || [];
-    for (const vr of valueRanges) {
+    for (let vrIdx = 0; vrIdx < valueRanges.length; vrIdx++) {
+      const vr = valueRanges[vrIdx];
+      const tabName = chunkTitles[vrIdx];
       const rows = vr.values || [];
-      for (const row of rows) {
+      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+        const row = rows[rowIdx];
         const codeRaw = (row[cfg.codeColIndexInRange] ?? "").toString();
         const codeCanon = canonSku(codeRaw);
         if (codeCanon === targetCanon) {
-          return (row[cfg.captionColIndexInRange] ?? "").toString();
+          const caption = (row[cfg.captionColIndexInRange] ?? "").toString();
+          return { caption, tabName, rowNum: rowIdx + 1 };
         }
       }
     }
   }
 
   return null;
+}
+
+// ===== Data validation cache: key = "shopKey:tabName" =====
+const khoValidationCache = new Map();
+const KHO_VALIDATION_CACHE_TTL_MS = 30 * 60 * 1000; // 30 phút
+
+// Từ khoá ưu tiên để match giá trị "đã đăng" trong dropdown (thứ tự ưu tiên giảm dần)
+const POSTED_KEYWORDS = ["đã đăng", "da dang", "đăng rồi", "dang roi", "done", "posted", "đã up", "da up"];
+
+/**
+ * Đọc data validation (dropdown) từ một ô cụ thể trong kho sheet.
+ * Trả về mảng string các giá trị dropdown, hoặc null nếu không có validation.
+ */
+async function readCellDropdownValues({ sheets, spreadsheetId, tabName, col, rowNum }) {
+  const cacheKey = `${spreadsheetId}:${tabName}:${col}`;
+  const cached = khoValidationCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < KHO_VALIDATION_CACHE_TTL_MS) {
+    return cached.values;
+  }
+
+  const resp = await sheets.spreadsheets.get({
+    spreadsheetId,
+    ranges: [`${tabName}!${col}${rowNum}`],
+    fields: "sheets.data.rowData.values.dataValidation"
+  });
+
+  const cellData = resp.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
+  const validation = cellData?.dataValidation;
+
+  if (!validation || validation.condition?.type !== "ONE_OF_LIST") {
+    // Không có dropdown validation — cache null để không gọi lại liên tục
+    khoValidationCache.set(cacheKey, { ts: Date.now(), values: null });
+    return null;
+  }
+
+  const values = (validation.condition.values || [])
+    .map(v => v.userEnteredValue)
+    .filter(Boolean);
+
+  khoValidationCache.set(cacheKey, { ts: Date.now(), values });
+  console.log(`[KHO] Loaded dropdown values for ${tabName}!${col}: [${values.join(", ")}]`);
+  return values;
+}
+
+/**
+ * Chọn giá trị "đã đăng" từ danh sách dropdown values.
+ * Match bằng cách normalize tiếng Việt rồi so sánh với từ khoá.
+ * Trả về { value, matched } hoặc null nếu không match được.
+ */
+function pickPostedValue(dropdownValues) {
+  if (!dropdownValues || dropdownValues.length === 0) return null;
+
+  // Normalize: bỏ dấu, lowercase
+  function norm(s) {
+    return String(s)
+      .trim()
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[đĐ]/g, "d");
+  }
+
+  for (const kw of POSTED_KEYWORDS) {
+    for (const val of dropdownValues) {
+      if (norm(val).includes(norm(kw))) {
+        return { value: val, matched: kw };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Cập nhật cột "tình trạng đăng bài" trong kho sheet sau khi đăng IG thành công.
+ * Tự đọc data validation rules để ghi đúng giá trị dropdown.
+ */
+async function updateKhoPostStatus({ sheets, shopKey, tabName, rowNum }) {
+  const cfg = SHOP[shopKey];
+  const col = cfg.khoStatusCol;
+  const range = `${tabName}!${col}${rowNum}`;
+
+  // 1) Đọc dropdown values từ data validation
+  const dropdownValues = await readCellDropdownValues({
+    sheets,
+    spreadsheetId: cfg.sheetId,
+    tabName,
+    col,
+    rowNum
+  });
+
+  let valueToWrite;
+
+  if (dropdownValues && dropdownValues.length > 0) {
+    const pick = pickPostedValue(dropdownValues);
+    if (pick) {
+      valueToWrite = pick.value;
+      console.log(`[KHO] Matched dropdown value "${pick.value}" via keyword "${pick.matched}"`);
+    } else {
+      // Có dropdown nhưng không match được — throw để cảnh báo
+      throw new Error(
+        `Không tìm thấy giá trị "đã đăng" trong dropdown [${dropdownValues.join(", ")}]. ` +
+        `Nhờ cập nhật thủ công hoặc kiểm tra lại dropdown trong sheet kho.`
+      );
+    }
+  } else {
+    // Không có data validation — ghi trực tiếp
+    valueToWrite = "Đã đăng";
+    console.log(`[KHO] No dropdown validation found, writing default: "${valueToWrite}"`);
+  }
+
+  // 2) Ghi giá trị
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: cfg.sheetId,
+    range,
+    valueInputOption: "RAW",
+    requestBody: { values: [[valueToWrite]] }
+  });
+
+  console.log(`[KHO] Updated ${cfg.name} kho status: ${tabName}!${col}${rowNum} = "${valueToWrite}"`);
+  return valueToWrite;
 }
 
 function isVideoName(name) {
@@ -308,8 +441,11 @@ async function tick({ client, sheets, drive }) {
         const folderName = await getFolderName(drive, job.folder_id);
         const sku = job.sku || deriveSkuFromFolderName(folderName);
 
-        const caption = await findCaptionBySku({ sheets, shopKey: job.shop, sku });
-        if (!caption) throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${job.shop}`);
+        const skuResult = await findCaptionBySku({ sheets, shopKey: job.shop, sku });
+        if (!skuResult || !skuResult.caption) {
+          throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${job.shop}`);
+        }
+        const { caption, tabName: khoTab, rowNum: khoRow } = skuResult;
 
         const mediaFiles = await listMediaFiles(drive, job.folder_id);
 
@@ -333,8 +469,27 @@ async function tick({ client, sheets, drive }) {
           }
         });
 
-        if (channel) {
-          await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}`);
+        // ===== Cập nhật tình trạng đăng bài trong kho sheet =====
+        try {
+          const statusValue = await updateKhoPostStatus({
+            sheets,
+            shopKey: job.shop,
+            tabName: khoTab,
+            rowNum: khoRow
+          });
+          if (channel) {
+            await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n📋 Kho: cập nhật → **${statusValue}**`);
+          }
+        } catch (khoErr) {
+          console.error(`[KHO] Failed to update kho status for SKU=${sku}:`, khoErr.message);
+          // Không throw — job IG vẫn thành công, chỉ cảnh báo lỗi kho
+          if (channel) {
+            await channel.send(
+              `✅ Đăng IG thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n` +
+              `⚠️ Không cập nhật được tình trạng trong sheet kho: ${khoErr.message}\n` +
+              `**Nhờ cập nhật cột trạng thái đăng bài trong kho thủ công nhé!**`
+            );
+          }
         }
       } catch (e) {
         const msg = (e.response?.data && JSON.stringify(e.response.data))
@@ -352,9 +507,16 @@ async function tick({ client, sheets, drive }) {
         });
 
         if (channel) {
-          const statusEmoji = isRL ? "⏳" : "❌";
-          const statusText = isRL ? "Rate-limit, sẽ thử lại lần sau" : "Đăng thất bại";
-          await channel.send(`${statusEmoji} ${statusText} (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1800)}\`\`\``);
+          if (isRL) {
+            await channel.send(
+              `⏳ Rate-limit, sẽ thử lại lần sau (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1800)}\`\`\``
+            );
+          } else {
+            await channel.send(
+              `❌ Đăng thất bại (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1500)}\`\`\`\n` +
+              `⚠️ **Nhờ mọi người đăng bài thủ công lên IG và cập nhật cột tình trạng đăng bài trong sheet kho nhé!**`
+            );
+          }
         }
 
         // FIX: Nếu rate-limit, dừng xử lý các job còn lại trong tick này
@@ -428,8 +590,10 @@ async function main() {
       const folderName = await getFolderName(drive, folderId);
       const sku = deriveSkuFromFolderName(folderName);
 
-      const caption = await findCaptionBySku({ sheets, shopKey, sku });
-      if (!caption) throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${shopKey}`);
+      const skuResult = await findCaptionBySku({ sheets, shopKey, sku });
+      if (!skuResult || !skuResult.caption) {
+        throw new Error(`Không tìm thấy caption cho SKU=${sku} trong sheet shop ${shopKey}`);
+      }
 
       const mediaFiles = await listMediaFiles(drive, folderId);
 
