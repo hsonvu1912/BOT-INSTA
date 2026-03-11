@@ -69,9 +69,9 @@ const SHOP = {
     pageToken: mustEnv("FB_PAGE_TOKEN_BURGER"),
     sheetId: mustEnv("SHEET_ID_BURGER"),
     sheetTab: null,
-    captionColIndexInRange: 2,
-    codeColIndexInRange: 0,
-    khoStatusCol: "D"       // Cột "tình trạng đăng bài" trong kho Burger
+    captionColIndexInRange: 3,  // Cột I (F+3)
+    codeColIndexInRange: 0,     // Cột F
+    khoStatusCol: "D"           // Cột "tình trạng đăng bài" trong kho Burger
   }
 };
 
@@ -128,7 +128,7 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   const allTitles = await getTabTitles(sheets, cfg.sheetId);
   const titles = cfg.sheetTab ? [cfg.sheetTab] : sortTabsNewestFirst(allTitles.filter(tabIsLikelyInventory));
 
-  const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:H`));
+  const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:I`));
 
   const CHUNK = 80;
   for (let i = 0; i < ranges.length; i += CHUNK) {
