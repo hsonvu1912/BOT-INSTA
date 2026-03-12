@@ -29,7 +29,13 @@ function isServerError(e) {
   return status && status >= 500;
 }
 
-// ===== FIX: Detect rate-limit error =====
+function isOnlyPhotoOrVideoError(e) {
+  const err = e?.response?.data?.error;
+  if (!err) return false;
+  const msg = typeof err.message === "string" ? err.message : "";
+  return msg.includes("Only photo or video can be accepted");
+}
+
 function isRateLimitError(e) {
   const err = e?.response?.data?.error;
   return err?.code === 4 || err?.code === 32 || err?.code === 613;
@@ -45,14 +51,10 @@ async function igCreateMediaContainer(payload) {
 
   const params = new URLSearchParams();
   if (caption) params.set("caption", caption);
-
   if (mediaType) params.set("media_type", mediaType);
-
   if (img) params.set("image_url", img);
   if (vid) params.set("video_url", vid);
-
   if (isCarouselItem) params.set("is_carousel_item", "true");
-
   params.set("access_token", pageToken);
 
   const url = `${BASE}/${igUserId}/media`;
@@ -78,12 +80,9 @@ function buildVideoVariants(payload) {
   ];
 }
 
-// FIX: Tăng delay retry lên 15s, thêm xử lý rate-limit (chờ 60s)
 async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs = 15000 } = {}) {
   const { vid } = pickMediaUrls(payload);
-
   const variants = vid ? buildVideoVariants(payload) : [payload];
-
   let lastErr = null;
 
   for (const v of variants) {
@@ -93,10 +92,16 @@ async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs =
       } catch (e) {
         lastErr = e;
 
-        // FIX: Rate limit -> chờ lâu hơn rồi retry
         if (isRateLimitError(e) && i < retries) {
-          const waitMs = 60000 * (i + 1); // 60s, 120s, 180s
-          console.log(`[IG] Rate limit hit. Waiting ${waitMs / 1000}s before retry (attempt ${i + 1}/${retries})`);
+          const waitMs = 60000 * (i + 1);
+          console.log(`[IG] Rate limit hit. Waiting ${waitMs / 1000}s (attempt ${i + 1}/${retries})`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+
+        if (isOnlyPhotoOrVideoError(e) && i < retries) {
+          const waitMs = 20000 * (i + 1);
+          console.log(`[IG] "Only photo or video" — proxy likely cold. Retry in ${waitMs / 1000}s (attempt ${i + 1}/${retries})`);
           await new Promise(r => setTimeout(r, waitMs));
           continue;
         }
@@ -127,11 +132,31 @@ async function igGetContainerStatus({ creationId, pageToken }) {
   return r.data;
 }
 
-// FIX: Poll mỗi 20s thay vì 5s để giảm API calls
-async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000 }) {
+// ===== v4: waitUntilFinished — smart single-poll cho ảnh =====
+// Ảnh JPEG: chờ 2s → check 1 lần → nếu FINISHED thì xong (1 API call thay vì 3-5)
+//           nếu chưa → vào loop backoff bình thường
+// Video: vào loop backoff luôn (8s → 15s)
+async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000, isVideo = false }) {
   const started = Date.now();
 
+  // Ảnh: chờ 2s rồi check 1 shot trước
+  if (!isVideo) {
+    await new Promise(res => setTimeout(res, 2000));
+    const st = await igGetContainerStatus({ creationId, pageToken });
+    const code = st.status_code || st.status;
+    if (code === "FINISHED") return;
+    if (code === "ERROR") throw new Error(`IG container ERROR: ${JSON.stringify(st)}`);
+    // Chưa FINISHED → fall through vào loop (hiếm khi xảy ra với ảnh)
+  }
+
+  // Loop với progressive backoff
+  let pollInterval = isVideo ? 8000 : 5000;
+  const maxInterval = isVideo ? 15000 : 10000;
+  const backoffFactor = 1.5;
+
   while (true) {
+    await new Promise(res => setTimeout(res, pollInterval));
+
     const st = await igGetContainerStatus({ creationId, pageToken });
     const code = st.status_code || st.status;
 
@@ -142,8 +167,62 @@ async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 
       throw new Error(`Timeout chờ FINISHED: ${creationId} | ${JSON.stringify(st)}`);
     }
 
-    // FIX: 20s thay vì 5s — giảm 75% API calls cho polling
-    await new Promise(res => setTimeout(res, 20000));
+    pollInterval = Math.min(Math.round(pollInterval * backoffFactor), maxInterval);
+  }
+}
+
+// ===== v4: Batch poll — chờ nhiều containers cùng lúc =====
+// Thay vì poll từng child tuần tự, poll tất cả trong 1 vòng lặp
+// Mỗi vòng check tất cả chưa FINISHED, tốn ít API calls hơn tổng cộng
+// vì nhiều container sẽ FINISHED cùng lúc (nhất là ảnh)
+async function waitAllUntilFinished({ items, pageToken, timeoutMs = 15 * 60 * 1000 }) {
+  // items = [{ creationId, isVideo }]
+  const started = Date.now();
+  const pending = new Map(); // creationId → { isVideo }
+  for (const it of items) {
+    pending.set(it.creationId, { isVideo: it.isVideo });
+  }
+
+  // Bước 1: chờ 2s rồi check tất cả 1 shot (ảnh thường xong ngay)
+  await new Promise(res => setTimeout(res, 2500));
+
+  for (const [cid] of pending) {
+    const st = await igGetContainerStatus({ creationId: cid, pageToken });
+    const code = st.status_code || st.status;
+    if (code === "FINISHED") {
+      pending.delete(cid);
+    } else if (code === "ERROR") {
+      throw new Error(`IG container ERROR: ${cid} | ${JSON.stringify(st)}`);
+    }
+  }
+
+  if (pending.size === 0) return; // Tất cả ảnh xong sau 1 lần poll
+
+  console.log(`[BATCH-POLL] ${items.length - pending.size}/${items.length} done after first check. ${pending.size} remaining (likely videos)...`);
+
+  // Bước 2: poll remaining với backoff
+  let pollInterval = 8000;
+  const maxInterval = 15000;
+
+  while (pending.size > 0) {
+    await new Promise(res => setTimeout(res, pollInterval));
+
+    for (const [cid] of pending) {
+      const st = await igGetContainerStatus({ creationId: cid, pageToken });
+      const code = st.status_code || st.status;
+      if (code === "FINISHED") {
+        pending.delete(cid);
+      } else if (code === "ERROR") {
+        throw new Error(`IG container ERROR: ${cid} | ${JSON.stringify(st)}`);
+      }
+    }
+
+    if (Date.now() - started > timeoutMs) {
+      const remaining = [...pending.keys()].join(", ");
+      throw new Error(`Timeout chờ FINISHED cho: ${remaining}`);
+    }
+
+    pollInterval = Math.min(Math.round(pollInterval * 1.4), maxInterval);
   }
 }
 
@@ -169,7 +248,6 @@ async function igPublish({ igUserId, pageToken, creationId }) {
   return r.data.id;
 }
 
-// FIX: Tăng delay publish retry lên 15s, thêm xử lý rate-limit
 async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8, delayMs = 15000 }) {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -179,7 +257,6 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
       const code = err?.code;
       const sub = err?.error_subcode;
 
-      // FIX: Rate limit -> chờ 60s+
       if (isRateLimitError(e) && i < retries) {
         const waitMs = 60000 * (i + 1);
         console.log(`[IG] Rate limit on publish. Waiting ${waitMs / 1000}s (attempt ${i + 1}/${retries})`);
@@ -211,5 +288,6 @@ module.exports = {
   igPublishWithRetry,
   igGetPermalink,
   waitUntilFinished,
+  waitAllUntilFinished,
   isRateLimitError
 };
