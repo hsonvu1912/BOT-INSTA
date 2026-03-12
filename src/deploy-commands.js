@@ -15,7 +15,8 @@ const commands = [
         .setRequired(true)
         .addChoices(
           { name: "Màu mè", value: "MAUME" },
-          { name: "Burger", value: "BURGER" }
+          { name: "Burger", value: "BURGER" },
+          { name: "Test", value: "TEST" }
         )
     )
     .addStringOption(o =>
