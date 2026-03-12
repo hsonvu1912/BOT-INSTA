@@ -39,17 +39,28 @@ const {
   igPublishWithRetry,
   igGetPermalink,
   waitUntilFinished,
+  waitAllUntilFinished,
   isRateLimitError
 } = require("./ig");
 
 const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
 
-// FIX: Delay giữa các job để tránh rate-limit (30s)
-const DELAY_BETWEEN_JOBS_MS = 30000;
+// ===== v4: Timing config =====
+const DELAY_BETWEEN_JOBS_MS = 5000;
+const COOLDOWN_EVERY_N_JOBS = 5;
+const COOLDOWN_MS = 30000;
+const DELAY_BETWEEN_CHILDREN_MS = 500;
 
-// FIX: Delay giữa carousel children (3s)
-const DELAY_BETWEEN_CHILDREN_MS = 3000;
+// Auto-retry config
+const MAX_AUTO_RETRIES = 3;
+const RETRY_BACKOFF_MS = 10 * 1000;
+
+// ===== Env helper: optional env (không throw nếu thiếu) =====
+function optEnv(name) {
+  const v = process.env[name];
+  return v && String(v).trim() ? String(v).trim() : null;
+}
 
 // ===== Shop config =====
 const SHOP = {
@@ -59,9 +70,11 @@ const SHOP = {
     pageToken: mustEnv("FB_PAGE_TOKEN_MAUME"),
     sheetId: mustEnv("SHEET_ID_MAUME"),
     sheetTab: null,
+    // Range E:L — code ở cột L (index 7), caption ở cột E (index 0)
+    sheetRange: "E:L",
     captionColIndexInRange: 0,
     codeColIndexInRange: 7,
-    khoStatusCol: "B"       // Cột "tình trạng đăng bài" trong kho Màu Mè
+    khoStatusCol: "B"
   },
   BURGER: {
     name: "Burger",
@@ -69,11 +82,36 @@ const SHOP = {
     pageToken: mustEnv("FB_PAGE_TOKEN_BURGER"),
     sheetId: mustEnv("SHEET_ID_BURGER"),
     sheetTab: null,
-    captionColIndexInRange: 3,  // Cột I (F+3)
-    codeColIndexInRange: 0,     // Cột F
-    khoStatusCol: "D"           // Cột "tình trạng đăng bài" trong kho Burger
+    // Range F:I — code ở cột F (index 0), caption ở cột I (index 3)
+    sheetRange: "F:I",
+    captionColIndexInRange: 3,
+    codeColIndexInRange: 0,
+    khoStatusCol: "D"
   }
 };
+
+// ===== TEST shop: chỉ thêm nếu env vars có đủ =====
+const testIgUserId = optEnv("IG_USER_ID_TEST");
+const testPageToken = optEnv("FB_PAGE_TOKEN_TEST");
+const testSheetId = optEnv("SHEET_ID_TEST");
+
+if (testIgUserId && testPageToken && testSheetId) {
+  SHOP.TEST = {
+    name: "Test",
+    igUserId: testIgUserId,
+    pageToken: testPageToken,
+    sheetId: testSheetId,
+    sheetTab: null,
+    // Range A:C — code ở cột B (index 1), caption ở cột C (index 2)
+    sheetRange: "A:C",
+    captionColIndexInRange: 2,
+    codeColIndexInRange: 1,
+    khoStatusCol: "A"
+  };
+  console.log("[CONFIG] TEST shop enabled");
+} else {
+  console.log("[CONFIG] TEST shop not configured (missing IG_USER_ID_TEST / FB_PAGE_TOKEN_TEST / SHEET_ID_TEST)");
+}
 
 // ===== Multi-tab SKU lookup =====
 const TAB_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -116,19 +154,17 @@ async function getTabTitles(sheets, spreadsheetId) {
   return titles;
 }
 
-/**
- * Tìm caption theo SKU trong kho sheet.
- * Trả về { caption, tabName, rowNum } hoặc null nếu không tìm thấy.
- * tabName + rowNum dùng để cập nhật tình trạng đăng bài sau khi publish.
- */
 async function findCaptionBySku({ sheets, shopKey, sku }) {
   const cfg = SHOP[shopKey];
+  if (!cfg) throw new Error(`Unknown shop: ${shopKey}`);
+
   const targetCanon = canonSku(sku);
 
   const allTitles = await getTabTitles(sheets, cfg.sheetId);
   const titles = cfg.sheetTab ? [cfg.sheetTab] : sortTabsNewestFirst(allTitles.filter(tabIsLikelyInventory));
 
-  const ranges = titles.map(t => (shopKey === "MAUME" ? `${t}!E:L` : `${t}!F:I`));
+  // Dùng sheetRange từ config thay vì hardcode
+  const ranges = titles.map(t => `${t}!${cfg.sheetRange}`);
 
   const CHUNK = 80;
   for (let i = 0; i < ranges.length; i += CHUNK) {
@@ -161,17 +197,11 @@ async function findCaptionBySku({ sheets, shopKey, sku }) {
   return null;
 }
 
-// ===== Data validation cache: key = "shopKey:tabName" =====
+// ===== Data validation cache =====
 const khoValidationCache = new Map();
-const KHO_VALIDATION_CACHE_TTL_MS = 30 * 60 * 1000; // 30 phút
-
-// Từ khoá ưu tiên để match giá trị "đã đăng" trong dropdown (thứ tự ưu tiên giảm dần)
+const KHO_VALIDATION_CACHE_TTL_MS = 30 * 60 * 1000;
 const POSTED_KEYWORDS = ["đã đăng", "da dang", "đăng rồi", "dang roi", "done", "posted", "đã up", "da up"];
 
-/**
- * Đọc data validation (dropdown) từ một ô cụ thể trong kho sheet.
- * Trả về mảng string các giá trị dropdown, hoặc null nếu không có validation.
- */
 async function readCellDropdownValues({ sheets, spreadsheetId, tabName, col, rowNum }) {
   const cacheKey = `${spreadsheetId}:${tabName}:${col}`;
   const cached = khoValidationCache.get(cacheKey);
@@ -189,7 +219,6 @@ async function readCellDropdownValues({ sheets, spreadsheetId, tabName, col, row
   const validation = cellData?.dataValidation;
 
   if (!validation || validation.condition?.type !== "ONE_OF_LIST") {
-    // Không có dropdown validation — cache null để không gọi lại liên tục
     khoValidationCache.set(cacheKey, { ts: Date.now(), values: null });
     return null;
   }
@@ -203,22 +232,12 @@ async function readCellDropdownValues({ sheets, spreadsheetId, tabName, col, row
   return values;
 }
 
-/**
- * Chọn giá trị "đã đăng" từ danh sách dropdown values.
- * Match bằng cách normalize tiếng Việt rồi so sánh với từ khoá.
- * Trả về { value, matched } hoặc null nếu không match được.
- */
 function pickPostedValue(dropdownValues) {
   if (!dropdownValues || dropdownValues.length === 0) return null;
 
-  // Normalize: bỏ dấu, lowercase
   function norm(s) {
-    return String(s)
-      .trim()
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[đĐ]/g, "d");
+    return String(s).trim().toLowerCase().normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "").replace(/[đĐ]/g, "d");
   }
 
   for (const kw of POSTED_KEYWORDS) {
@@ -228,52 +247,37 @@ function pickPostedValue(dropdownValues) {
       }
     }
   }
-
   return null;
 }
 
-/**
- * Cập nhật cột "tình trạng đăng bài" trong kho sheet sau khi đăng IG thành công.
- * Tự đọc data validation rules để ghi đúng giá trị dropdown.
- */
 async function updateKhoPostStatus({ sheets, shopKey, tabName, rowNum }) {
   const cfg = SHOP[shopKey];
   const col = cfg.khoStatusCol;
   const range = `${tabName}!${col}${rowNum}`;
 
-  // 1) Đọc dropdown values từ data validation
   const dropdownValues = await readCellDropdownValues({
-    sheets,
-    spreadsheetId: cfg.sheetId,
-    tabName,
-    col,
-    rowNum
+    sheets, spreadsheetId: cfg.sheetId, tabName, col, rowNum
   });
 
   let valueToWrite;
-
   if (dropdownValues && dropdownValues.length > 0) {
     const pick = pickPostedValue(dropdownValues);
     if (pick) {
       valueToWrite = pick.value;
       console.log(`[KHO] Matched dropdown value "${pick.value}" via keyword "${pick.matched}"`);
     } else {
-      // Có dropdown nhưng không match được — throw để cảnh báo
       throw new Error(
         `Không tìm thấy giá trị "đã đăng" trong dropdown [${dropdownValues.join(", ")}]. ` +
         `Nhờ cập nhật thủ công hoặc kiểm tra lại dropdown trong sheet kho.`
       );
     }
   } else {
-    // Không có data validation — ghi trực tiếp
     valueToWrite = "Đã đăng";
     console.log(`[KHO] No dropdown validation found, writing default: "${valueToWrite}"`);
   }
 
-  // 2) Ghi giá trị
   await sheets.spreadsheets.values.update({
-    spreadsheetId: cfg.sheetId,
-    range,
+    spreadsheetId: cfg.sheetId, range,
     valueInputOption: "RAW",
     requestBody: { values: [[valueToWrite]] }
   });
@@ -296,47 +300,16 @@ function prioritizeVideosFirst(mediaFiles) {
   return videos.length ? [...videos, ...images] : mediaFiles;
 }
 
-async function validateMediaUrl(mediaUrl, fileName) {
-  const safeUrl = String(mediaUrl || "").replace(/token=[^&]+/i, "token=***");
-
-  if (!mediaUrl || !mediaUrl.startsWith("https://")) {
-    throw new Error(`MEDIA URL invalid: ${safeUrl} | file=${fileName}`);
-  }
-
-  const headResp = await axios.head(mediaUrl, { timeout: 15000 }).catch(err => err.response);
-  const headStatus = headResp?.status;
-  const headCt = headResp?.headers?.["content-type"] || "";
-  console.log("[MEDIA-HEAD]", headStatus, headCt, safeUrl, fileName);
-
-  if (headStatus === 200 && (headCt.startsWith("image/") || headCt.startsWith("video/"))) return;
-
-  const getResp = await axios.get(mediaUrl, {
-    timeout: 20000,
-    responseType: "arraybuffer",
-    headers: { Range: "bytes=0-1023" },
-    validateStatus: () => true
-  });
-
-  const st = getResp.status;
-  const ct = getResp.headers?.["content-type"] || "";
-  console.log("[MEDIA-GET]", st, ct, safeUrl, fileName);
-
-  if ((st === 200 || st === 206) && (ct.startsWith("image/") || ct.startsWith("video/"))) return;
-
-  throw new Error(`MEDIA URL not serving media: status=${st} ct=${ct} url=${safeUrl}`);
-}
-
+// ===== v4: publishJob — batch create + batch poll =====
 async function publishJob({ shopKey, caption, mediaFiles }) {
   const cfg = SHOP[shopKey];
   const ordered = prioritizeVideosFirst(mediaFiles);
 
-  // Single
+  // Single file
   if (ordered.length === 1) {
     const f = ordered[0];
     const isVideo = isVideoName(f.name);
-
     const mediaUrl = driveDirectDownloadUrl(f.id);
-    await validateMediaUrl(mediaUrl, f.name);
 
     const creationId = await igCreateMediaContainerWithRetry({
       igUserId: cfg.igUserId,
@@ -347,7 +320,7 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: false
     });
 
-    await waitUntilFinished({ creationId, pageToken: cfg.pageToken });
+    await waitUntilFinished({ creationId, pageToken: cfg.pageToken, isVideo });
 
     const mediaId = await igPublishWithRetry({
       igUserId: cfg.igUserId,
@@ -359,14 +332,14 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
     return { mediaId, permalink };
   }
 
-  // Carousel
-  const childrenIds = [];
+  // Carousel — batch approach
+  console.log(`[PUBLISH] Creating ${ordered.length} child containers...`);
+  const children = [];
+
   for (let idx = 0; idx < ordered.length; idx++) {
     const f = ordered[idx];
     const isVideo = isVideoName(f.name);
-
     const mediaUrl = driveDirectDownloadUrl(f.id);
-    await validateMediaUrl(mediaUrl, f.name);
 
     const childCreationId = await igCreateMediaContainerWithRetry({
       igUserId: cfg.igUserId,
@@ -377,15 +350,23 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
       isCarouselItem: true
     });
 
-    await waitUntilFinished({ creationId: childCreationId, pageToken: cfg.pageToken });
-    childrenIds.push(childCreationId);
+    children.push({ creationId: childCreationId, isVideo });
 
-    // FIX: Delay giữa các children để giảm burst
     if (idx < ordered.length - 1) {
       await new Promise(r => setTimeout(r, DELAY_BETWEEN_CHILDREN_MS));
     }
   }
 
+  console.log(`[PUBLISH] All ${children.length} containers created. Batch polling...`);
+
+  await waitAllUntilFinished({
+    items: children,
+    pageToken: cfg.pageToken
+  });
+
+  console.log(`[PUBLISH] All children FINISHED. Creating carousel parent...`);
+
+  const childrenIds = children.map(c => c.creationId);
   const parentCreationId = await igCreateCarouselContainer({
     igUserId: cfg.igUserId,
     pageToken: cfg.pageToken,
@@ -393,7 +374,7 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
     caption
   });
 
-  await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken });
+  await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken, isVideo: false });
 
   const mediaId = await igPublishWithRetry({
     igUserId: cfg.igUserId,
@@ -405,7 +386,7 @@ async function publishJob({ shopKey, caption, mediaFiles }) {
   return { mediaId, permalink };
 }
 
-// FIX: Lock để tick() không chồng chéo khi job chạy lâu
+// Lock tick
 let tickRunning = false;
 
 async function tick({ client, sheets, drive }) {
@@ -419,24 +400,56 @@ async function tick({ client, sheets, drive }) {
     const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
     const now = nowVn();
 
-    const due = items.filter(j => {
-      if (j.status !== "PENDING") return false;
-      const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
-      if (!dt.isValid) return false;
-      return dt <= now;
-    });
+    const due = [];
+    const retryable = [];
 
-    // FIX: Xử lý tuần tự từng job, có delay giữa các job
-    for (let jobIdx = 0; jobIdx < due.length; jobIdx++) {
-      const job = due[jobIdx];
+    for (const j of items) {
+      // Kiểm tra shop có được cấu hình không
+      if (!SHOP[j.shop]) continue;
+
+      if (j.status === "PENDING") {
+        const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+        if (dt.isValid && dt <= now) {
+          due.push(j);
+        }
+      }
+
+      if (j.status === "FAILED" && j.attempts < MAX_AUTO_RETRIES) {
+        const scheduledDt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+        if (!scheduledDt.isValid) continue;
+        const retryAfter = scheduledDt.plus({ milliseconds: j.attempts * RETRY_BACKOFF_MS });
+        if (now >= retryAfter) {
+          retryable.push(j);
+        }
+      }
+    }
+
+    const allJobs = [...due, ...retryable];
+
+    if (retryable.length > 0) {
+      console.log(`[TICK] Found ${due.length} due + ${retryable.length} retryable jobs`);
+    }
+
+    let consecutiveJobCount = 0;
+
+    for (let jobIdx = 0; jobIdx < allJobs.length; jobIdx++) {
+      const job = allJobs[jobIdx];
+      const isRetry = job.status === "FAILED";
       const channel = await client.channels.fetch(job.channel_id).catch(() => null);
 
       try {
+        const statusLabel = isRetry ? `RETRYING (attempt ${job.attempts + 1}/${MAX_AUTO_RETRIES})` : "RUNNING";
         await updateRow(sheets, {
           queueSheetId: QUEUE_SHEET_ID,
           rowNum: job.rowNum,
-          patch: { status: "RUNNING", attempts: job.attempts + 1, last_error: "" }
+          patch: { status: statusLabel, attempts: job.attempts + 1, last_error: "" }
         });
+
+        if (isRetry && channel) {
+          await channel.send(
+            `🔄 Auto-retry lần ${job.attempts + 1}/${MAX_AUTO_RETRIES} (${SHOP[job.shop]?.name || job.shop}) | SKU: **${job.sku}**`
+          );
+        }
 
         const folderName = await getFolderName(drive, job.folder_id);
         const sku = job.sku || deriveSkuFromFolderName(folderName);
@@ -469,20 +482,16 @@ async function tick({ client, sheets, drive }) {
           }
         });
 
-        // ===== Cập nhật tình trạng đăng bài trong kho sheet =====
         try {
           const statusValue = await updateKhoPostStatus({
-            sheets,
-            shopKey: job.shop,
-            tabName: khoTab,
-            rowNum: khoRow
+            sheets, shopKey: job.shop, tabName: khoTab, rowNum: khoRow
           });
           if (channel) {
-            await channel.send(`✅ Đăng thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n📋 Kho: cập nhật → **${statusValue}**`);
+            const retryNote = isRetry ? " (auto-retry thành công)" : "";
+            await channel.send(`✅ Đăng thành công${retryNote} (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n📋 Kho: cập nhật → **${statusValue}**`);
           }
         } catch (khoErr) {
           console.error(`[KHO] Failed to update kho status for SKU=${sku}:`, khoErr.message);
-          // Không throw — job IG vẫn thành công, chỉ cảnh báo lỗi kho
           if (channel) {
             await channel.send(
               `✅ Đăng IG thành công (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n` +
@@ -491,14 +500,24 @@ async function tick({ client, sheets, drive }) {
             );
           }
         }
+
+        consecutiveJobCount++;
+
       } catch (e) {
         const msg = (e.response?.data && JSON.stringify(e.response.data))
           ? JSON.stringify(e.response.data)
           : (e.message || String(e));
 
-        // FIX: Nếu rate-limit, đánh dấu PENDING lại thay vì FAILED để retry lần sau
         const isRL = isRateLimitError(e);
-        const newStatus = isRL ? "PENDING" : "FAILED";
+
+        let newStatus;
+        if (isRL) {
+          newStatus = "PENDING";
+        } else if (job.attempts + 1 < MAX_AUTO_RETRIES) {
+          newStatus = "FAILED";
+        } else {
+          newStatus = "GIVE_UP";
+        }
 
         await updateRow(sheets, {
           queueSheetId: QUEUE_SHEET_ID,
@@ -511,25 +530,32 @@ async function tick({ client, sheets, drive }) {
             await channel.send(
               `⏳ Rate-limit, sẽ thử lại lần sau (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1800)}\`\`\``
             );
+          } else if (newStatus === "FAILED") {
+            await channel.send(
+              `⚠️ Lỗi lần ${job.attempts + 1}/${MAX_AUTO_RETRIES}, sẽ tự retry sau ${RETRY_BACKOFF_MS / 1000}s (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1200)}\`\`\``
+            );
           } else {
             await channel.send(
-              `❌ Đăng thất bại (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1500)}\`\`\`\n` +
+              `❌ Đăng thất bại sau ${MAX_AUTO_RETRIES} lần thử (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nLý do: \`\`\`${msg.slice(0, 1500)}\`\`\`\n` +
               `⚠️ **Nhờ mọi người đăng bài thủ công lên IG và cập nhật cột tình trạng đăng bài trong sheet kho nhé!**`
             );
           }
         }
 
-        // FIX: Nếu rate-limit, dừng xử lý các job còn lại trong tick này
         if (isRL) {
           console.log("[TICK] Rate-limited — stopping remaining jobs, will retry next tick");
           break;
         }
       }
 
-      // FIX: Delay giữa các job
-      if (jobIdx < due.length - 1) {
-        console.log(`[TICK] Waiting ${DELAY_BETWEEN_JOBS_MS / 1000}s before next job...`);
-        await new Promise(r => setTimeout(r, DELAY_BETWEEN_JOBS_MS));
+      // Smart delay giữa jobs
+      if (jobIdx < allJobs.length - 1) {
+        if (consecutiveJobCount > 0 && consecutiveJobCount % COOLDOWN_EVERY_N_JOBS === 0) {
+          console.log(`[TICK] Cooldown ${COOLDOWN_MS / 1000}s after ${consecutiveJobCount} jobs...`);
+          await new Promise(r => setTimeout(r, COOLDOWN_MS));
+        } else {
+          await new Promise(r => setTimeout(r, DELAY_BETWEEN_JOBS_MS));
+        }
       }
     }
   } finally {
@@ -544,7 +570,6 @@ async function main() {
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // FIX: Delay token check 30s sau khi start để không burst cùng lúc
     setTimeout(() => {
       startTokenReminder(client);
     }, 30000);
@@ -562,8 +587,7 @@ async function main() {
       });
     }
 
-    // FIX: Tick mỗi 90s thay vì 60s
-    setInterval(() => tick({ client, sheets, drive }).catch(console.error), 90_000);
+    setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
     tick({ client, sheets, drive }).catch(console.error);
   });
 
@@ -582,6 +606,10 @@ async function main() {
       const shopKey = interaction.options.getString("shop", true);
       const timeStr = interaction.options.getString("time", true);
       const folderUrl = interaction.options.getString("folder", true);
+
+      if (!SHOP[shopKey]) {
+        throw new Error(`Shop "${shopKey}" chưa được cấu hình. Kiểm tra env vars trên Railway.`);
+      }
 
       const dt = parseVnDatetime(timeStr);
       if (dt < nowVn().minus({ minutes: 1 })) throw new Error("Giờ đăng đang ở quá khứ.");
