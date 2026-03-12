@@ -2,6 +2,28 @@
 const { URL } = require("url");
 const { mustEnv } = require("./utils");
 
+// Cache metadata để khi IG fetch không cần gọi Drive 2 lần
+const metaCache = new Map();
+const META_CACHE_TTL_MS = 30 * 60 * 1000;
+
+function getCachedMeta(fileId) {
+  const entry = metaCache.get(fileId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > META_CACHE_TTL_MS) {
+    metaCache.delete(fileId);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedMeta(fileId, data) {
+  if (metaCache.size > 500) {
+    const oldest = metaCache.keys().next().value;
+    metaCache.delete(oldest);
+  }
+  metaCache.set(fileId, { ts: Date.now(), data });
+}
+
 function createMediaHandler({ drive }) {
   const token = mustEnv("MEDIA_PROXY_TOKEN");
 
@@ -15,14 +37,12 @@ function createMediaHandler({ drive }) {
 
       const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-      // Health check
       if (u.pathname === "/health") {
         res.statusCode = 200;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         return res.end("ok");
       }
 
-      // /media/<fileId>
       const m = u.pathname.match(/^\/media\/([a-zA-Z0-9_-]+)$/);
       if (!m) {
         res.statusCode = 404;
@@ -30,7 +50,6 @@ function createMediaHandler({ drive }) {
         return res.end("not found");
       }
 
-      // Token guard
       if (u.searchParams.get("token") !== token) {
         res.statusCode = 403;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -39,21 +58,33 @@ function createMediaHandler({ drive }) {
 
       const fileId = m[1];
 
-      // 1) Get metadata
-      const meta = await drive.files.get({
-        fileId,
-        fields: "id,name,mimeType,size",
-        supportsAllDrives: true,
-      });
+      let mimeType, size;
+      const cached = getCachedMeta(fileId);
 
-      const { mimeType, size } = meta.data || {};
+      if (cached) {
+        mimeType = cached.mimeType;
+        size = cached.size;
+      } else {
+        const meta = await drive.files.get({
+          fileId,
+          fields: "id,name,mimeType,size",
+          supportsAllDrives: true,
+        });
+
+        mimeType = meta.data?.mimeType;
+        size = meta.data?.size;
+
+        if (mimeType && (mimeType.startsWith("image/") || mimeType.startsWith("video/"))) {
+          setCachedMeta(fileId, { mimeType, size });
+        }
+      }
+
       if (!mimeType || (!mimeType.startsWith("image/") && !mimeType.startsWith("video/"))) {
         res.statusCode = 415;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         return res.end("unsupported media type");
       }
 
-      // 2) HEAD request: return headers only (no stream)
       if (req.method === "HEAD") {
         res.statusCode = 200;
         res.setHeader("Content-Type", mimeType);
@@ -62,13 +93,11 @@ function createMediaHandler({ drive }) {
         return res.end();
       }
 
-      // 3) Open stream from Drive
       const file = await drive.files.get(
         { fileId, alt: "media", supportsAllDrives: true },
         { responseType: "stream" }
       );
 
-      // 4) Set correct headers (NO Content-Disposition to avoid invalid chars)
       res.statusCode = 200;
       res.setHeader("Content-Type", mimeType);
       if (size) res.setHeader("Content-Length", String(size));
