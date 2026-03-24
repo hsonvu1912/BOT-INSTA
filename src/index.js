@@ -416,8 +416,23 @@ async function tick({ client, sheets, drive }) {
 }
 
 async function main() {
+  // ===== Global error handlers — catch mọi lỗi bị nuốt =====
+  process.on("unhandledRejection", (reason) => {
+    console.error("[UNHANDLED_REJECTION]", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[UNCAUGHT_EXCEPTION]", err);
+  });
+
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   const { sheets, drive } = await getClients();
+
+  // ===== Discord connection monitoring =====
+  client.on("warn", (msg) => console.warn("[DISCORD_WARN]", msg));
+  client.on("error", (err) => console.error("[DISCORD_ERROR]", err.message));
+  client.on("shardDisconnect", (ev, id) => console.warn(`[DISCORD] Shard ${id} disconnected (code ${ev.code})`));
+  client.on("shardReconnecting", (id) => console.log(`[DISCORD] Shard ${id} reconnecting...`));
+  client.on("shardResume", (id, replayed) => console.log(`[DISCORD] Shard ${id} resumed (replayed ${replayed})`));
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
@@ -433,6 +448,12 @@ async function main() {
 
     setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
     tick({ client, sheets, drive }).catch(console.error);
+
+    // ===== Heartbeat log mỗi 30 phút — chứng minh bot còn sống =====
+    setInterval(() => {
+      const mem = process.memoryUsage();
+      console.log(`[HEARTBEAT] RSS=${(mem.rss / 1024 / 1024).toFixed(0)}MB heap=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB uptime=${(process.uptime() / 3600).toFixed(1)}h ws=${client.ws.ping}ms`);
+    }, 30 * 60 * 1000);
   });
 
   client.on("interactionCreate", async (interaction) => {
@@ -440,7 +461,19 @@ async function main() {
     if (interaction.commandName === "testtoken") return handleTestTokenSlash(interaction, client);
     if (interaction.commandName !== "ig_schedule") return;
 
-    await interaction.deferReply();
+    const t0 = Date.now();
+    const user = interaction.user?.tag || "unknown";
+    console.log(`[CMD] /ig_schedule from ${user} (ws_ping=${client.ws.ping}ms)`);
+
+    try {
+      await interaction.deferReply();
+      console.log(`[CMD] deferReply OK (${Date.now() - t0}ms)`);
+    } catch (deferErr) {
+      // deferReply failed = Discord đã timeout (>3s) hoặc network lỗi
+      console.error(`[CMD] deferReply FAILED after ${Date.now() - t0}ms: ${deferErr.message}`);
+      return; // Không thể editReply nếu defer fail
+    }
+
     try {
       const shopKey = interaction.options.getString("shop", true);
       const timeStr = interaction.options.getString("time", true);
@@ -453,6 +486,8 @@ async function main() {
       const folderId = parseFolderIdFromUrl(folderUrl);
       const folderName = await getFolderName(drive, folderId);
       const sku = deriveSkuFromFolderName(folderName);
+      console.log(`[CMD] SKU=${sku} shop=${shopKey} (${Date.now() - t0}ms)`);
+
       const skuResult = await findCaptionBySku({ sheets, shopKey, sku });
       if (!skuResult?.caption) throw new Error(`Không tìm caption SKU=${sku} shop ${shopKey}`);
       const mediaFiles = await listMediaFiles(drive, folderId);
@@ -462,11 +497,17 @@ async function main() {
         shop: shopKey, scheduled_time: dt.toISO(), folder_url: folderUrl, folder_id: folderId, sku, channel_id: interaction.channelId
       }});
 
+      console.log(`[CMD] ✅ Queued SKU=${sku} (${Date.now() - t0}ms total)`);
       await interaction.editReply(
         `✅ Đã tạo lịch\n- Shop: **${SHOP[shopKey].name}**\n- Giờ: **${dt.toFormat("yyyy-MM-dd HH:mm")}**\n- SKU: **${sku}**\n- Media: **${mediaFiles.length}** file\n- Folder: ${folderUrl}`
       );
     } catch (e) {
-      await interaction.editReply(`❌ ${e.message || String(e)}`);
+      console.error(`[CMD] ❌ FAILED after ${Date.now() - t0}ms: ${e.message}`);
+      try {
+        await interaction.editReply(`❌ ${e.message || String(e)}`);
+      } catch (replyErr) {
+        console.error(`[CMD] editReply also failed: ${replyErr.message}`);
+      }
     }
   });
 
