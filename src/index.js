@@ -273,6 +273,47 @@ async function publishJob({ shopKey, caption, mediaFiles, drive }) {
   }
 }
 
+// ===== Rate limit warning =====
+const SAFE_JOBS_PER_HOUR = 12;
+
+function countJobsInHourWindow(items, shopKey, targetDt) {
+  const hourStart = targetDt.startOf("hour");
+  const hourEnd = hourStart.plus({ hours: 1 });
+  return items.filter(j => {
+    if (j.shop !== shopKey) return false;
+    if (!["PENDING", "RUNNING"].includes(j.status) && !j.status.startsWith("RETRYING")) return false;
+    const jDt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+    return jDt.isValid && jDt >= hourStart && jDt < hourEnd;
+  }).length;
+}
+
+function findNextAvailableSlot(items, shopKey, startDt) {
+  for (let offset = 1; offset <= 6; offset++) {
+    const slotStart = startDt.startOf("hour").plus({ hours: offset });
+    const count = countJobsInHourWindow(items, shopKey, slotStart);
+    if (count < SAFE_JOBS_PER_HOUR) {
+      return { hour: slotStart, count };
+    }
+  }
+  return null;
+}
+
+function buildRateLimitWarning(items, shopKey, targetDt) {
+  const count = countJobsInHourWindow(items, shopKey, targetDt);
+  if (count < SAFE_JOBS_PER_HOUR) return null;
+
+  const hourStart = targetDt.startOf("hour");
+  const hourEnd = hourStart.plus({ hours: 1 });
+  let msg = `⚠️ **Cảnh báo rate limit**: Khung ${hourStart.toFormat("HH:mm")}–${hourEnd.toFormat("HH:mm")} đã có **${count} bài** cho ${SHOP[shopKey].name} (giới hạn an toàn: ${SAFE_JOBS_PER_HOUR} bài/giờ)\n💡 Dùng \`/ig_cancel\` để thu hồi lịch nếu cần`;
+
+  const slot = findNextAvailableSlot(items, shopKey, targetDt);
+  if (slot) {
+    const slotEnd = slot.hour.plus({ hours: 1 });
+    msg += `\n→ Gợi ý: khung **${slot.hour.toFormat("HH:mm")}–${slotEnd.toFormat("HH:mm")}** còn trống (${slot.count} bài)`;
+  }
+  return msg;
+}
+
 // ===== Dedup =====
 async function cancelSiblingFailedJobs({ sheets, allItems, currentJob }) {
   const siblings = allItems.filter(j =>
@@ -415,6 +456,45 @@ async function tick({ client, sheets, drive }) {
   } finally { tickRunning = false; }
 }
 
+async function handleIgCancel(interaction, { sheets }) {
+  try {
+    await interaction.deferReply();
+  } catch { return; }
+
+  try {
+    const shopKey = interaction.options.getString("shop", true);
+    const sku = interaction.options.getString("sku", true);
+    if (!SHOP[shopKey]) throw new Error(`Shop "${shopKey}" chưa cấu hình.`);
+
+    const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
+    const targetCanon = canonSku(sku);
+    const pending = items.filter(j =>
+      j.shop === shopKey && j.status === "PENDING" && canonSku(j.sku) === targetCanon
+    );
+
+    if (!pending.length) {
+      await interaction.editReply(`❌ Không tìm thấy lịch PENDING cho SKU=**${sku}** shop **${SHOP[shopKey].name}**`);
+      return;
+    }
+
+    for (const job of pending) {
+      await updateRow(sheets, {
+        queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
+        patch: { status: "CANCELLED", last_error: `Thu hồi bởi ${interaction.user.tag}` }
+      });
+    }
+
+    const times = pending.map(j => {
+      const jDt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+      return jDt.isValid ? jDt.toFormat("yyyy-MM-dd HH:mm") : j.scheduled_time;
+    });
+    await interaction.editReply(`✅ Đã thu hồi **${pending.length}** lịch cho SKU=**${sku}** (${SHOP[shopKey].name})\n- Giờ: ${times.join(", ")}`);
+    console.log(`[CMD] /ig_cancel SKU=${sku} shop=${shopKey} → cancelled ${pending.length} jobs by ${interaction.user.tag}`);
+  } catch (e) {
+    try { await interaction.editReply(`❌ ${e.message}`); } catch {}
+  }
+}
+
 async function main() {
   // ===== Global error handlers — catch mọi lỗi bị nuốt =====
   process.on("unhandledRejection", (reason) => {
@@ -459,6 +539,7 @@ async function main() {
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName === "testtoken") return handleTestTokenSlash(interaction, client);
+    if (interaction.commandName === "ig_cancel") return handleIgCancel(interaction, { sheets });
     if (interaction.commandName !== "ig_schedule") return;
 
     const t0 = Date.now();
@@ -492,15 +573,18 @@ async function main() {
       if (!skuResult?.caption) throw new Error(`Không tìm caption SKU=${sku} shop ${shopKey}`);
       const mediaFiles = await listMediaFiles(drive, folderId);
 
+      // Rate limit check
+      const { items: queueItems } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
+      const rateLimitWarning = buildRateLimitWarning(queueItems, shopKey, dt);
+
       await appendJob(sheets, { queueSheetId: QUEUE_SHEET_ID, job: {
         created_at: nowVn().toISO(), requester_id: interaction.user.id, requester_tag: interaction.user.tag,
         shop: shopKey, scheduled_time: dt.toISO(), folder_url: folderUrl, folder_id: folderId, sku, channel_id: interaction.channelId
       }});
 
       console.log(`[CMD] ✅ Queued SKU=${sku} (${Date.now() - t0}ms total)`);
-      await interaction.editReply(
-        `✅ Đã tạo lịch\n- Shop: **${SHOP[shopKey].name}**\n- Giờ: **${dt.toFormat("yyyy-MM-dd HH:mm")}**\n- SKU: **${sku}**\n- Media: **${mediaFiles.length}** file\n- Folder: ${folderUrl}`
-      );
+      const successMsg = `✅ Đã tạo lịch\n- Shop: **${SHOP[shopKey].name}**\n- Giờ: **${dt.toFormat("yyyy-MM-dd HH:mm")}**\n- SKU: **${sku}**\n- Media: **${mediaFiles.length}** file\n- Folder: ${folderUrl}`;
+      await interaction.editReply(rateLimitWarning ? `${rateLimitWarning}\n\n${successMsg}` : successMsg);
     } catch (e) {
       console.error(`[CMD] ❌ FAILED after ${Date.now() - t0}ms: ${e.message}`);
       try {

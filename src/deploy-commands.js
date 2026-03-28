@@ -29,6 +29,25 @@ const commands = [
         .setDescription("Link folder Google Drive")
         .setRequired(true)
     )
+  ,
+  new SlashCommandBuilder()
+    .setName("ig_cancel")
+    .setDescription("Thu hồi lịch đăng IG (chỉ huỷ được bài PENDING)")
+    .addStringOption(o =>
+      o.setName("shop")
+        .setDescription("Chọn shop")
+        .setRequired(true)
+        .addChoices(
+          { name: "Màu mè", value: "MAUME" },
+          { name: "Burger", value: "BURGER" },
+          { name: "Test", value: "TEST" }
+        )
+    )
+    .addStringOption(o =>
+      o.setName("sku")
+        .setDescription("Mã SKU cần huỷ")
+        .setRequired(true)
+    )
 ].map(c => c.toJSON());
 
 (async () => {
