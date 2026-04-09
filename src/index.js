@@ -66,8 +66,8 @@ const testSheetId = optEnv("SHEET_ID_TEST");
 if (testIgUserId && testPageToken && testSheetId) {
   SHOP.TEST = {
     name: "Test", igUserId: testIgUserId, pageToken: testPageToken,
-    sheetId: testSheetId, sheetTab: null, sheetRange: "A:C",
-    captionColIndexInRange: 2, codeColIndexInRange: 1, khoStatusCol: "A"
+    sheetId: testSheetId, sheetTab: null, sheetRange: "E:L",
+    captionColIndexInRange: 0, codeColIndexInRange: 7, khoStatusCol: "B"
   };
   console.log("[CONFIG] TEST shop enabled");
 } else {
