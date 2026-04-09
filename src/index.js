@@ -14,7 +14,7 @@ const { createMediaHandler, prefetchFile, clearBufferedFiles } = require("./medi
 
 const {
   parseFolderIdFromUrl, getFolderName, deriveSkuFromFolderName,
-  listMediaFiles, driveDirectDownloadUrl
+  listMediaFiles, listChildFolders, driveDirectDownloadUrl
 } = require("./drive");
 
 const { parseVnDatetime, appendJob, fetchAllJobs, updateRow, nowVn } = require("./queue");
@@ -495,6 +495,103 @@ async function handleIgCancel(interaction, { sheets }) {
   }
 }
 
+// ===== /ig_folder_schedule handler =====
+async function handleIgFolderSchedule(interaction, { sheets, drive }) {
+  const t0 = Date.now();
+  const user = interaction.user?.tag || "unknown";
+  console.log(`[CMD] /ig_folder_schedule from ${user} (ws_ping=${interaction.client.ws.ping}ms)`);
+
+  try {
+    await interaction.deferReply();
+    console.log(`[CMD] deferReply OK (${Date.now() - t0}ms)`);
+  } catch (deferErr) {
+    console.error(`[CMD] deferReply FAILED after ${Date.now() - t0}ms: ${deferErr.message}`);
+    return;
+  }
+
+  try {
+    const shopKey = interaction.options.getString("shop", true);
+    const timeStr = interaction.options.getString("time", true);
+    const folderUrl = interaction.options.getString("folder", true);
+    if (!SHOP[shopKey]) throw new Error(`Shop "${shopKey}" chưa cấu hình.`);
+
+    const startDt = parseVnDatetime(timeStr);
+    if (startDt < nowVn().minus({ minutes: 1 })) throw new Error("Giờ đăng ở quá khứ.");
+
+    const parentFolderId = parseFolderIdFromUrl(folderUrl);
+    const childFolders = await listChildFolders(drive, parentFolderId);
+
+    if (childFolders.length === 0) throw new Error("Folder cha không có subfolder nào.");
+
+    console.log(`[CMD] Found ${childFolders.length} subfolders in parent (${Date.now() - t0}ms)`);
+
+    const results = [];
+    const errors = [];
+
+    for (let i = 0; i < childFolders.length; i++) {
+      const child = childFolders[i];
+      const dt = startDt.plus({ minutes: i * 5 });
+
+      try {
+        const sku = deriveSkuFromFolderName(child.name);
+        const skuResult = await findCaptionBySku({ sheets, shopKey, sku });
+        if (!skuResult?.caption) throw new Error(`Không tìm caption SKU=${sku}`);
+
+        const mediaFiles = await listMediaFiles(drive, child.id);
+        const childFolderUrl = `https://drive.google.com/drive/folders/${child.id}`;
+
+        await appendJob(sheets, { queueSheetId: QUEUE_SHEET_ID, job: {
+          created_at: nowVn().toISO(), requester_id: interaction.user.id, requester_tag: interaction.user.tag,
+          shop: shopKey, scheduled_time: dt.toISO(), folder_url: childFolderUrl, folder_id: child.id, sku, channel_id: interaction.channelId
+        }});
+
+        results.push({ sku, dt, mediaCount: mediaFiles.length, folderUrl: childFolderUrl });
+        console.log(`[CMD] Queued subfolder ${i + 1}/${childFolders.length} SKU=${sku} at ${dt.toFormat("HH:mm")}`);
+      } catch (err) {
+        errors.push({ folderName: child.name, error: err.message || String(err) });
+        console.log(`[CMD] Skipped subfolder "${child.name}": ${err.message}`);
+      }
+    }
+
+    // Build Discord response
+    const shopName = SHOP[shopKey].name;
+    let msg = `📁 **Folder Schedule** — Shop: **${shopName}**\nFolder cha: ${folderUrl}\n`;
+
+    if (results.length > 0) {
+      msg += `\n✅ **${results.length} bài đã lên lịch:**\n`;
+      for (const r of results) {
+        msg += `• ${r.dt.toFormat("HH:mm")} — SKU: **${r.sku}** — ${r.mediaCount} file\n`;
+      }
+    }
+
+    if (errors.length > 0) {
+      msg += `\n❌ **${errors.length} subfolder lỗi (đã bỏ qua):**\n`;
+      for (const e of errors) {
+        msg += `• **${e.folderName}**: ${e.error}\n`;
+      }
+    }
+
+    if (results.length === 0) {
+      msg += `\n⚠️ Không có subfolder nào hợp lệ để lên lịch.`;
+    }
+
+    // Discord message limit 2000 chars
+    if (msg.length > 1900) {
+      msg = msg.slice(0, 1900) + "\n… (truncated)";
+    }
+
+    console.log(`[CMD] ✅ Folder schedule done: ${results.length} queued, ${errors.length} errors (${Date.now() - t0}ms total)`);
+    await interaction.editReply(msg);
+  } catch (e) {
+    console.error(`[CMD] ❌ Folder schedule FAILED after ${Date.now() - t0}ms: ${e.message}`);
+    try {
+      await interaction.editReply(`❌ ${e.message || String(e)}`);
+    } catch (replyErr) {
+      console.error(`[CMD] editReply also failed: ${replyErr.message}`);
+    }
+  }
+}
+
 async function main() {
   // ===== Global error handlers — catch mọi lỗi bị nuốt =====
   process.on("unhandledRejection", (reason) => {
@@ -540,6 +637,7 @@ async function main() {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName === "testtoken") return handleTestTokenSlash(interaction, client);
     if (interaction.commandName === "ig_cancel") return handleIgCancel(interaction, { sheets });
+    if (interaction.commandName === "ig_folder_schedule") return handleIgFolderSchedule(interaction, { sheets, drive });
     if (interaction.commandName !== "ig_schedule") return;
 
     const t0 = Date.now();

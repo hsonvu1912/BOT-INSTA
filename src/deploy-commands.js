@@ -48,6 +48,30 @@ const commands = [
         .setDescription("Mã SKU cần huỷ")
         .setRequired(true)
     )
+  ,
+  new SlashCommandBuilder()
+    .setName("ig_folder_schedule")
+    .setDescription("Lên lịch đăng IG từ các subfolder trong 1 folder cha, cách nhau 5 phút")
+    .addStringOption(o =>
+      o.setName("shop")
+        .setDescription("Chọn shop")
+        .setRequired(true)
+        .addChoices(
+          { name: "Màu mè", value: "MAUME" },
+          { name: "Burger", value: "BURGER" },
+          { name: "Test", value: "TEST" }
+        )
+    )
+    .addStringOption(o =>
+      o.setName("time")
+        .setDescription("Giờ đăng bài ĐẦU TIÊN (YYYY-MM-DD HH:mm) giờ VN")
+        .setRequired(true)
+    )
+    .addStringOption(o =>
+      o.setName("folder")
+        .setDescription("Link folder CHA chứa các subfolder (mỗi subfolder = 1 bài)")
+        .setRequired(true)
+    )
 ].map(c => c.toJSON());
 
 (async () => {

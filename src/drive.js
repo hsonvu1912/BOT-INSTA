@@ -1,5 +1,22 @@
 const { parseDriveFolderId, naturalSortByName, isJpeg, isMp4 } = require("./utils");
 
+async function listChildFolders(drive, parentFolderId) {
+  const folders = [];
+  let pageToken = undefined;
+  do {
+    const r = await drive.files.list({
+      q: `'${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: "nextPageToken, files(id,name)",
+      pageSize: 100,
+      pageToken
+    });
+    folders.push(...(r.data.files || []));
+    pageToken = r.data.nextPageToken;
+  } while (pageToken);
+  folders.sort(naturalSortByName);
+  return folders;
+}
+
 async function getFolderName(drive, folderId) {
   const r = await drive.files.get({ fileId: folderId, fields: "id,name" });
   return r.data.name;
@@ -71,6 +88,7 @@ function parseFolderIdFromUrl(folderUrl) {
 module.exports = {
   getFolderName,
   listMediaFiles,
+  listChildFolders,
   driveDirectDownloadUrl,
   deriveSkuFromFolderName,
   parseFolderIdFromUrl
