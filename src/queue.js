@@ -15,6 +15,10 @@ function parseVnDatetime(input) {
 }
 
 async function appendJob(sheets, { queueSheetId, job }) {
+  // Columns A-O unchanged (existing schema). P=batch_id, Q=first_media_id added for the
+  // folder-schedule sorter web app. Single-shot /ig_schedule leaves them empty and keeps
+  // default status=PENDING; /ig_folder_schedule passes status=DRAFT + batch info so the
+  // sorter can pick the rows up and convert them to PENDING after user confirms.
   const values = [[
     job.created_at,
     job.requester_id,
@@ -25,17 +29,19 @@ async function appendJob(sheets, { queueSheetId, job }) {
     job.folder_id,
     job.sku,
     job.channel_id,
-    "PENDING",
+    job.status || "PENDING",
     "0",
     "",
     "",
     "",
-    ""
+    "",
+    job.batch_id || "",
+    job.first_media_id || ""
   ]];
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: queueSheetId,
-    range: `${QUEUE_TAB}!A:O`,
+    range: `${QUEUE_TAB}!A:Q`,
     valueInputOption: "RAW",
     requestBody: { values }
   });
@@ -44,7 +50,7 @@ async function appendJob(sheets, { queueSheetId, job }) {
 async function fetchAllJobs(sheets, { queueSheetId }) {
   const r = await sheets.spreadsheets.values.get({
     spreadsheetId: queueSheetId,
-    range: `${QUEUE_TAB}!A:O`
+    range: `${QUEUE_TAB}!A:Q`
   });
   const rows = r.data.values || [];
   if (rows.length <= 1) return { header: rows[0] || [], items: [] };
@@ -69,7 +75,9 @@ async function fetchAllJobs(sheets, { queueSheetId }) {
       last_error: get(11),
       ig_media_id: get(12),
       ig_permalink: get(13),
-      published_at: get(14)
+      published_at: get(14),
+      batch_id: get(15),
+      first_media_id: get(16)
     };
   });
 
