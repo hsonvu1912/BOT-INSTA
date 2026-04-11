@@ -27,6 +27,7 @@ const {
 
 const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const QUEUE_SHEET_ID = mustEnv("SHEET_ID_QUEUE");
+const IG_SORTER_WEB_APP_URL = process.env.IG_SORTER_WEB_APP_URL || "";
 
 const DELAY_BETWEEN_JOBS_MS = 5000;
 const COOLDOWN_EVERY_N_JOBS = 5;
@@ -468,12 +469,14 @@ async function handleIgCancel(interaction, { sheets }) {
 
     const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
     const targetCanon = canonSku(sku);
+    // Also include DRAFT rows so a user who regrets a /ig_folder_schedule batch can
+    // clean up without having to open the sorter Web App.
     const pending = items.filter(j =>
-      j.shop === shopKey && j.status === "PENDING" && canonSku(j.sku) === targetCanon
+      j.shop === shopKey && (j.status === "PENDING" || j.status === "DRAFT") && canonSku(j.sku) === targetCanon
     );
 
     if (!pending.length) {
-      await interaction.editReply(`❌ Không tìm thấy lịch PENDING cho SKU=**${sku}** shop **${SHOP[shopKey].name}**`);
+      await interaction.editReply(`❌ Không tìm thấy lịch PENDING/DRAFT cho SKU=**${sku}** shop **${SHOP[shopKey].name}**`);
       return;
     }
 
@@ -492,6 +495,90 @@ async function handleIgCancel(interaction, { sheets }) {
     console.log(`[CMD] /ig_cancel SKU=${sku} shop=${shopKey} → cancelled ${pending.length} jobs by ${interaction.user.tag}`);
   } catch (e) {
     try { await interaction.editReply(`❌ ${e.message}`); } catch {}
+  }
+}
+
+// ===== /batch-confirm HTTP handler (called by Apps Script sorter) =====
+// Reads every row with the given batch_id, groups by channel_id, and sends a summary
+// back to each Discord channel that originally created the batch. Auth uses the same
+// MEDIA_PROXY_TOKEN the media-server already trusts so no extra env var is required.
+async function handleBatchConfirm(req, res, url, { client, sheets }) {
+  try {
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      return res.end("method not allowed");
+    }
+    const token = process.env.MEDIA_PROXY_TOKEN;
+    if (!token || url.searchParams.get("token") !== token) {
+      res.statusCode = 403;
+      return res.end("forbidden");
+    }
+    const batchId = url.searchParams.get("batch") || "";
+    if (!batchId) {
+      res.statusCode = 400;
+      return res.end("missing batch");
+    }
+
+    const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
+    const rows = items.filter(j => j.batch_id === batchId);
+    if (!rows.length) {
+      res.statusCode = 404;
+      return res.end("batch not found");
+    }
+
+    // Group rows by channel so we message each channel once with its own summary.
+    const byChannel = new Map();
+    for (const r of rows) {
+      if (!byChannel.has(r.channel_id)) byChannel.set(r.channel_id, []);
+      byChannel.get(r.channel_id).push(r);
+    }
+
+    let pendingTotal = 0, cancelledTotal = 0;
+    for (const [channelId, group] of byChannel) {
+      const pending = group.filter(j => j.status === "PENDING").sort((a, b) => a.scheduled_time.localeCompare(b.scheduled_time));
+      const cancelled = group.filter(j => j.status === "CANCELLED");
+      pendingTotal += pending.length;
+      cancelledTotal += cancelled.length;
+
+      const shopName = pending[0] ? (SHOP[pending[0].shop]?.name || pending[0].shop) : "";
+      let msg = `✅ **Batch đã xác nhận** (${shopName})\n`;
+      msg += `• **${pending.length}** bài sẽ đăng`;
+      if (pending.length) {
+        const first = DateTime.fromISO(pending[0].scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+        const last = DateTime.fromISO(pending[pending.length - 1].scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+        msg += first.isValid && last.isValid ? ` (${first.toFormat("HH:mm")} → ${last.toFormat("HH:mm")})` : "";
+      }
+      msg += `\n• **${cancelled.length}** bài đã bỏ`;
+      if (cancelled.length) {
+        const skus = cancelled.map(j => j.sku).join(", ");
+        msg += `: ${skus}`;
+      }
+      if (pending.length) {
+        const list = pending.slice(0, 15).map(j => {
+          const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
+          return `• ${dt.isValid ? dt.toFormat("HH:mm") : j.scheduled_time} — **${j.sku}**`;
+        }).join("\n");
+        msg += `\n\n${list}`;
+        if (pending.length > 15) msg += `\n… (+${pending.length - 15} bài)`;
+      }
+      if (msg.length > 1900) msg = msg.slice(0, 1900) + "\n… (truncated)";
+
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) await channel.send(msg);
+      } catch (e) {
+        console.error(`[BATCH-CONFIRM] send failed channel=${channelId}: ${e.message}`);
+      }
+    }
+
+    console.log(`[BATCH-CONFIRM] batch=${batchId} pending=${pendingTotal} cancelled=${cancelledTotal}`);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ ok: true, pending: pendingTotal, cancelled: cancelledTotal }));
+  } catch (e) {
+    console.error(`[BATCH-CONFIRM] error: ${e.message}`);
+    res.statusCode = 500;
+    return res.end("error");
   }
 }
 
@@ -525,6 +612,10 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
 
     console.log(`[CMD] Found ${childFolders.length} subfolders in parent (${Date.now() - t0}ms)`);
 
+    // Batch id links all rows that belong to this folder schedule invocation so the
+    // Apps Script sorter can pick them up via ?batch=<id> query.
+    const batchId = `${Date.now()}_${interaction.user.id}`;
+
     const results = [];
     const errors = [];
 
@@ -539,14 +630,18 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
 
         const mediaFiles = await listMediaFiles(drive, child.id);
         const childFolderUrl = `https://drive.google.com/drive/folders/${child.id}`;
+        // media[0] after naturalSortByName in listMediaFiles matches the first slide
+        // the bot will actually publish — store it so the sorter shows the right thumbnail.
+        const firstMediaId = mediaFiles[0]?.id || "";
 
         await appendJob(sheets, { queueSheetId: QUEUE_SHEET_ID, job: {
           created_at: nowVn().toISO(), requester_id: interaction.user.id, requester_tag: interaction.user.tag,
-          shop: shopKey, scheduled_time: dt.toISO(), folder_url: childFolderUrl, folder_id: child.id, sku, channel_id: interaction.channelId
+          shop: shopKey, scheduled_time: dt.toISO(), folder_url: childFolderUrl, folder_id: child.id, sku, channel_id: interaction.channelId,
+          status: "DRAFT", batch_id: batchId, first_media_id: firstMediaId
         }});
 
         results.push({ sku, dt, mediaCount: mediaFiles.length, folderUrl: childFolderUrl });
-        console.log(`[CMD] Queued subfolder ${i + 1}/${childFolders.length} SKU=${sku} at ${dt.toFormat("HH:mm")}`);
+        console.log(`[CMD] Drafted subfolder ${i + 1}/${childFolders.length} SKU=${sku} at ${dt.toFormat("HH:mm")} batch=${batchId}`);
       } catch (err) {
         errors.push({ folderName: child.name, error: err.message || String(err) });
         console.log(`[CMD] Skipped subfolder "${child.name}": ${err.message}`);
@@ -555,17 +650,22 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
 
     // Build Discord response
     const shopName = SHOP[shopKey].name;
-    let msg = `📁 **Folder Schedule** — Shop: **${shopName}**\nFolder cha: ${folderUrl}\n`;
+    let msg = `📁 **Folder Schedule (nháp)** — Shop: **${shopName}**\nFolder cha: ${folderUrl}\n`;
 
     if (results.length > 0) {
-      msg += `\n✅ **${results.length} bài đã lên lịch:**\n`;
+      msg += `\n📋 **${results.length} bài đã tạo nháp:**\n`;
       for (const r of results) {
         msg += `• ${r.dt.toFormat("HH:mm")} — SKU: **${r.sku}** — ${r.mediaCount} file\n`;
+      }
+      if (IG_SORTER_WEB_APP_URL) {
+        msg += `\n🔗 **Mở trình sắp xếp để xem thumbnail, đổi thứ tự hoặc bỏ bài:**\n${IG_SORTER_WEB_APP_URL}?batch=${batchId}\n⚠️ Bài chỉ được đăng sau khi bấm **Done** trong trình sắp xếp.`;
+      } else {
+        msg += `\n⚠️ \`IG_SORTER_WEB_APP_URL\` chưa cấu hình — bài ở trạng thái DRAFT sẽ không đăng cho tới khi bạn đổi status sang PENDING thủ công. Batch ID: \`${batchId}\``;
       }
     }
 
     if (errors.length > 0) {
-      msg += `\n❌ **${errors.length} subfolder lỗi (đã bỏ qua):**\n`;
+      msg += `\n\n❌ **${errors.length} subfolder lỗi (đã bỏ qua):**\n`;
       for (const e of errors) {
         msg += `• **${e.folderName}**: ${e.error}\n`;
       }
@@ -580,7 +680,7 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
       msg = msg.slice(0, 1900) + "\n… (truncated)";
     }
 
-    console.log(`[CMD] ✅ Folder schedule done: ${results.length} queued, ${errors.length} errors (${Date.now() - t0}ms total)`);
+    console.log(`[CMD] ✅ Folder schedule done: ${results.length} drafted, ${errors.length} errors batch=${batchId} (${Date.now() - t0}ms total)`);
     await interaction.editReply(msg);
   } catch (e) {
     console.error(`[CMD] ❌ Folder schedule FAILED after ${Date.now() - t0}ms: ${e.message}`);
@@ -620,7 +720,17 @@ async function main() {
       global.__MEDIA_PROXY_STARTED__ = true;
       const handler = createMediaHandler({ drive });
       const port = process.env.PORT || 3000;
-      http.createServer((req, res) => handler(req, res)).listen(port, () => console.log(`🌐 Proxy :${port}`));
+      http.createServer(async (req, res) => {
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+          if (u.pathname === "/batch-confirm") {
+            return handleBatchConfirm(req, res, u, { client, sheets });
+          }
+        } catch (e) {
+          console.error("[HTTP] dispatcher error:", e.message);
+        }
+        return handler(req, res);
+      }).listen(port, () => console.log(`🌐 Proxy :${port}`));
     }
 
     setInterval(() => tick({ client, sheets, drive }).catch(console.error), 60_000);
