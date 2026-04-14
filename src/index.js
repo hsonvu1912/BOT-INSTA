@@ -526,6 +526,70 @@ async function handleBatchConfirm(req, res, url, { client, sheets }) {
       return res.end("batch not found");
     }
 
+    // ===== Auto-demote old SUCCESS rows so re-posts via /ig_folder_schedule bypass dedup =====
+    // When the user schedules a SKU again to replace a bad Instagram post, the tick loop would
+    // normally mark the new row CANCELLED_DUP because an older SUCCESS row exists. Flipping that
+    // old row to REPOSTED removes it from the dedup set while preserving its audit trail
+    // (ig_media_id / ig_permalink / published_at are passed through, not wiped).
+    //
+    // Race guard: if tick ran between the sorter flipping DRAFT→PENDING and this handler,
+    // some batch rows may already be CANCELLED_DUP("Already published"). We revive those back
+    // to PENDING so they participate in the demote pass and get re-scheduled.
+    const liveBatchRows = rows.filter(j =>
+      j.status === "PENDING" ||
+      (j.status === "CANCELLED_DUP" && j.last_error === "Already published")
+    );
+    const batchSkuKeys = new Set(liveBatchRows.map(r => `${r.shop}::${canonSku(r.sku)}`));
+    const batchRowNums = new Set(rows.map(r => r.rowNum));
+
+    const toDemote = items.filter(j =>
+      j.status === "SUCCESS" &&
+      !batchRowNums.has(j.rowNum) &&
+      batchSkuKeys.has(`${j.shop}::${canonSku(j.sku)}`)
+    );
+
+    let demotedCount = 0;
+    for (const old of toDemote) {
+      try {
+        await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: old.rowNum, patch: {
+          status: "REPOSTED",
+          attempts: old.attempts,
+          last_error: `Superseded by batch ${batchId}`,
+          ig_media_id: old.ig_media_id,
+          ig_permalink: old.ig_permalink,
+          published_at: old.published_at
+        }});
+        old.status = "REPOSTED";
+        demotedCount++;
+      } catch (e) {
+        console.error(`[REPOST] demote failed row=${old.rowNum}: ${e.message}`);
+      }
+    }
+
+    const toRevive = rows.filter(j => j.status === "CANCELLED_DUP" && j.last_error === "Already published");
+    let revivedCount = 0;
+    for (const row of toRevive) {
+      try {
+        await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: row.rowNum, patch: {
+          status: "PENDING",
+          attempts: row.attempts,
+          last_error: "",
+          ig_media_id: row.ig_media_id,
+          ig_permalink: row.ig_permalink,
+          published_at: row.published_at
+        }});
+        row.status = "PENDING";
+        row.last_error = "";
+        revivedCount++;
+      } catch (e) {
+        console.error(`[REPOST] revive failed row=${row.rowNum}: ${e.message}`);
+      }
+    }
+
+    if (demotedCount || revivedCount) {
+      console.log(`[REPOST] batch=${batchId} demoted=${demotedCount} revived=${revivedCount}`);
+    }
+
     // Group rows by channel so we message each channel once with its own summary.
     const byChannel = new Map();
     for (const r of rows) {
@@ -553,6 +617,9 @@ async function handleBatchConfirm(req, res, url, { client, sheets }) {
         const skus = cancelled.map(j => j.sku).join(", ");
         msg += `: ${skus}`;
       }
+      if (demotedCount) {
+        msg += `\n• ♻️ **${demotedCount}** bài SUCCESS cũ đã đánh dấu **REPOSTED** (để bài mới không bị chặn dedup)`;
+      }
       if (pending.length) {
         const list = pending.slice(0, 15).map(j => {
           const dt = DateTime.fromISO(j.scheduled_time, { zone: "Asia/Ho_Chi_Minh" });
@@ -571,10 +638,10 @@ async function handleBatchConfirm(req, res, url, { client, sheets }) {
       }
     }
 
-    console.log(`[BATCH-CONFIRM] batch=${batchId} pending=${pendingTotal} cancelled=${cancelledTotal}`);
+    console.log(`[BATCH-CONFIRM] batch=${batchId} pending=${pendingTotal} cancelled=${cancelledTotal} demoted=${demotedCount} revived=${revivedCount}`);
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, pending: pendingTotal, cancelled: cancelledTotal }));
+    return res.end(JSON.stringify({ ok: true, pending: pendingTotal, cancelled: cancelledTotal, demoted: demotedCount, revived: revivedCount }));
   } catch (e) {
     console.error(`[BATCH-CONFIRM] error: ${e.message}`);
     res.statusCode = 500;
