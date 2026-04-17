@@ -649,6 +649,23 @@ async function handleBatchConfirm(req, res, url, { client, sheets }) {
   }
 }
 
+// Pack lines into Discord-safe chunks without splitting mid-line (so markdown ** pairs stay balanced).
+function chunkLinesForDiscord(lines, maxChars) {
+  const chunks = [];
+  let buf = "";
+  for (const line of lines) {
+    const addLen = buf ? 1 + line.length : line.length; // 1 for "\n"
+    if (buf && buf.length + addLen > maxChars) {
+      chunks.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? buf + "\n" + line : line;
+    }
+  }
+  if (buf) chunks.push(buf);
+  return chunks;
+}
+
 // ===== /ig_folder_schedule handler =====
 async function handleIgFolderSchedule(interaction, { sheets, drive }) {
   const t0 = Date.now();
@@ -715,40 +732,44 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
       }
     }
 
-    // Build Discord response
+    // Build Discord response — split across messages so the sorter link never gets truncated by Discord's 2000-char cap
     const shopName = SHOP[shopKey].name;
-    let msg = `📁 **Folder Schedule (nháp)** — Shop: **${shopName}**\nFolder cha: ${folderUrl}\n`;
+    const firstTime = results[0]?.dt.toFormat("HH:mm");
+    const lastTime = results[results.length - 1]?.dt.toFormat("HH:mm");
+
+    let headerMsg = `📁 **Folder Schedule (nháp)** — Shop: **${shopName}**\nFolder cha: ${folderUrl}\n`;
+    if (results.length > 0) {
+      headerMsg += `\n📋 **${results.length} bài đã tạo nháp** (${firstTime} → ${lastTime}, chi tiết ở tin nhắn tiếp theo)\n`;
+      if (IG_SORTER_WEB_APP_URL) {
+        headerMsg += `\n🔗 **Mở trình sắp xếp để xem thumbnail, đổi thứ tự hoặc bỏ bài:**\n${IG_SORTER_WEB_APP_URL}?batch=${batchId}\n⚠️ Bài chỉ được đăng sau khi bấm **Done** trong trình sắp xếp.`;
+      } else {
+        headerMsg += `\n⚠️ \`IG_SORTER_WEB_APP_URL\` chưa cấu hình — bài ở trạng thái DRAFT sẽ không đăng cho tới khi bạn đổi status sang PENDING thủ công. Batch ID: \`${batchId}\``;
+      }
+    } else {
+      headerMsg += `\n⚠️ Không có subfolder nào hợp lệ để lên lịch.`;
+    }
+
+    console.log(`[CMD] ✅ Folder schedule done: ${results.length} drafted, ${errors.length} errors batch=${batchId} (${Date.now() - t0}ms total)`);
+    await interaction.editReply(headerMsg);
 
     if (results.length > 0) {
-      msg += `\n📋 **${results.length} bài đã tạo nháp:**\n`;
-      for (const r of results) {
-        msg += `• ${r.dt.toFormat("HH:mm")} — SKU: **${r.sku}** — ${r.mediaCount} file\n`;
-      }
-      if (IG_SORTER_WEB_APP_URL) {
-        msg += `\n🔗 **Mở trình sắp xếp để xem thumbnail, đổi thứ tự hoặc bỏ bài:**\n${IG_SORTER_WEB_APP_URL}?batch=${batchId}\n⚠️ Bài chỉ được đăng sau khi bấm **Done** trong trình sắp xếp.`;
-      } else {
-        msg += `\n⚠️ \`IG_SORTER_WEB_APP_URL\` chưa cấu hình — bài ở trạng thái DRAFT sẽ không đăng cho tới khi bạn đổi status sang PENDING thủ công. Batch ID: \`${batchId}\``;
+      const lines = results.map(r => `• ${r.dt.toFormat("HH:mm")} — SKU: **${r.sku}** — ${r.mediaCount} file`);
+      const chunks = chunkLinesForDiscord(lines, 1900);
+      for (let i = 0; i < chunks.length; i++) {
+        const prefix = chunks.length > 1 ? `📋 **Danh sách (${i + 1}/${chunks.length}):**\n` : `📋 **Danh sách chi tiết:**\n`;
+        await interaction.followUp(prefix + chunks[i]);
       }
     }
 
     if (errors.length > 0) {
-      msg += `\n\n❌ **${errors.length} subfolder lỗi (đã bỏ qua):**\n`;
-      for (const e of errors) {
-        msg += `• **${e.folderName}**: ${e.error}\n`;
+      const errLines = errors.map(e => `• **${e.folderName}**: ${e.error}`);
+      const errHeader = `❌ **${errors.length} subfolder lỗi (đã bỏ qua):**\n`;
+      const chunks = chunkLinesForDiscord(errLines, 1900 - errHeader.length);
+      for (let i = 0; i < chunks.length; i++) {
+        const prefix = i === 0 ? errHeader : `❌ **Tiếp theo (${i + 1}/${chunks.length}):**\n`;
+        await interaction.followUp(prefix + chunks[i]);
       }
     }
-
-    if (results.length === 0) {
-      msg += `\n⚠️ Không có subfolder nào hợp lệ để lên lịch.`;
-    }
-
-    // Discord message limit 2000 chars
-    if (msg.length > 1900) {
-      msg = msg.slice(0, 1900) + "\n… (truncated)";
-    }
-
-    console.log(`[CMD] ✅ Folder schedule done: ${results.length} drafted, ${errors.length} errors batch=${batchId} (${Date.now() - t0}ms total)`);
-    await interaction.editReply(msg);
   } catch (e) {
     console.error(`[CMD] ❌ Folder schedule FAILED after ${Date.now() - t0}ms: ${e.message}`);
     try {
