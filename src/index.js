@@ -35,6 +35,7 @@ const COOLDOWN_MS = 30000;
 const DELAY_BETWEEN_CHILDREN_MS = 500;
 const MAX_AUTO_RETRIES = 3;
 const RETRY_BACKOFF_MS = 10 * 1000;
+const RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000; // 30 phút pause sau khi gặp RL (app-level limit chia chung Màu Mè + Burger)
 
 function optEnv(name) {
   const v = process.env[name];
@@ -332,9 +333,19 @@ async function cancelSiblingFailedJobs({ sheets, allItems, currentJob }) {
 }
 
 let tickRunning = false;
+let rateLimitUntil = 0;       // timestamp ms — tick sẽ skip cho tới khi qua mốc này
+let rateLimitNotifiedChannels = new Set();  // tránh spam Discord khi đang cooldown
 
 async function tick({ client, sheets, drive }) {
   if (tickRunning) { console.log("[TICK] Skipped"); return; }
+
+  // Global cooldown: nếu đang trong RL cooldown → skip toàn bộ tick
+  if (Date.now() < rateLimitUntil) {
+    const remainingMin = Math.ceil((rateLimitUntil - Date.now()) / 60000);
+    console.log(`[TICK] In RL cooldown — ${remainingMin}m remaining`);
+    return;
+  }
+
   tickRunning = true;
 
   try {
@@ -431,18 +442,29 @@ async function tick({ client, sheets, drive }) {
         const msg = (e.response?.data && JSON.stringify(e.response.data)) ? JSON.stringify(e.response.data) : (e.message || String(e));
         const isRL = isRateLimitError(e);
         let newStatus = isRL ? "PENDING" : (job.attempts+1 < MAX_AUTO_RETRIES ? "FAILED" : "GIVE_UP");
+        // RL không phải lỗi của job → không tốn quota retry. Job sẽ tự thử lại sau cooldown.
+        const newAttempts = isRL ? job.attempts : job.attempts + 1;
 
         await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
-          patch: { status: newStatus, attempts: job.attempts+1, last_error: msg.slice(0,5000) }
+          patch: { status: newStatus, attempts: newAttempts, last_error: msg.slice(0,5000) }
         });
 
         if (channel) {
-          if (isRL) await channel.send(`⏳ Rate-limit (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1800)}\`\`\``);
+          if (isRL) {
+            const resumeAt = DateTime.fromMillis(Date.now() + RATE_LIMIT_COOLDOWN_MS).setZone("Asia/Ho_Chi_Minh");
+            await channel.send(`⏸️ **Instagram rate limit** (${SHOP[job.shop].name}) | SKU: **${job.sku}**\nBot tạm dừng **${RATE_LIMIT_COOLDOWN_MS/60000} phút** (đến **${resumeAt.toFormat("HH:mm")}**) để IG quota hồi phục. Job sẽ tự retry sau cooldown.\n\`\`\`${msg.slice(0,1500)}\`\`\``);
+            rateLimitNotifiedChannels.add(job.channel_id);
+          }
           else if (newStatus === "FAILED") await channel.send(`⚠️ Lỗi ${job.attempts+1}/${MAX_AUTO_RETRIES}, retry ${RETRY_BACKOFF_MS/1000}s (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1200)}\`\`\``);
           else await channel.send(`❌ Thất bại ${MAX_AUTO_RETRIES} lần (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1500)}\`\`\`\n⚠️ **Nhờ đăng tay + cập nhật kho!**`);
         }
 
-        if (isRL) { console.log("[TICK] Rate-limited — stopping"); break; }
+        if (isRL) {
+          // Set global cooldown để các tick sau skip toàn bộ — tránh spam API & lan rate limit sang shop còn lại
+          rateLimitUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          console.log(`[TICK] Rate-limited — global cooldown ${RATE_LIMIT_COOLDOWN_MS/60000}m until ${new Date(rateLimitUntil).toISOString()}`);
+          break;
+        }
       }
 
       if (jobIdx < allJobs.length - 1) {

@@ -98,12 +98,9 @@ async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs =
       } catch (e) {
         lastErr = e;
 
-        // Rate limit
-        if (isRateLimitError(e) && i < retries) {
-          const waitMs = 60000 * (i + 1);
-          console.log(`[IG] Rate limit. Waiting ${waitMs / 1000}s (attempt ${i + 1}/${retries})`);
-          await new Promise(r => setTimeout(r, waitMs));
-          continue;
+        // Rate limit → throw ngay, để tick-level xử lý (tránh spam API trong loop)
+        if (isRateLimitError(e)) {
+          throw e;
         }
 
         // ===== v7: Tất cả lỗi Meta fetch (photo/video, format, 9004) → retry với delay =====
@@ -222,11 +219,9 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
       return await igPublish({ igUserId, pageToken, creationId });
     } catch (e) {
       const err = e?.response?.data?.error;
-      if (isRateLimitError(e) && i < retries) {
-        const waitMs = 60000 * (i + 1);
-        console.log(`[IG] Rate limit publish. Wait ${waitMs / 1000}s (${i + 1}/${retries})`);
-        await new Promise(r => setTimeout(r, waitMs));
-        continue;
+      // Rate limit → throw ngay, để tick-level xử lý cooldown
+      if (isRateLimitError(e)) {
+        throw e;
       }
       if (err?.code === 9007 && err?.error_subcode === 2207027 && i < retries) {
         console.log(`[IG] Not ready. Retry publish in ${delayMs}ms (${i + 1}/${retries})`);
