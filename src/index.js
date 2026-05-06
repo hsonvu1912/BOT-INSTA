@@ -854,6 +854,25 @@ async function main() {
 
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
+
+    // === CHANNEL GUARD ===
+    // Chỉ cho slash commands chạy trong channels liệt kê ở env ALLOWED_CHANNEL_IDS (comma-separated).
+    // Env trống → bot hoạt động ở mọi channel (failsafe).
+    const allowedChannels = (process.env.ALLOWED_CHANNEL_IDS || "")
+      .split(",").map(s => s.trim()).filter(Boolean);
+    if (allowedChannels.length > 0 && !allowedChannels.includes(interaction.channelId)) {
+      const channelMentions = allowedChannels.map(id => `<#${id}>`).join(", ");
+      try {
+        await interaction.reply({
+          content: `❌ Lệnh này chỉ dùng được trong: ${channelMentions}`,
+          ephemeral: true,
+        });
+      } catch (e) {
+        console.error(`[CHANNEL_GUARD] reply failed: ${e.message}`);
+      }
+      return;
+    }
+
     if (interaction.commandName === "testtoken") return handleTestTokenSlash(interaction, client);
     if (interaction.commandName === "ig_cancel") return handleIgCancel(interaction, { sheets });
     if (interaction.commandName === "ig_folder_schedule") return handleIgFolderSchedule(interaction, { sheets, drive });
