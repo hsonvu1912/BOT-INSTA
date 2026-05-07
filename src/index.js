@@ -733,7 +733,7 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
         const skuResult = await findCaptionBySku({ sheets, shopKey, sku });
         if (!skuResult?.caption) throw new Error(`Không tìm caption SKU=${sku}`);
 
-        const mediaFiles = await listMediaFiles(drive, child.id);
+        const mediaFiles = await listMediaFiles(drive, child.id, { skipLimitCheck: true });
         const childFolderUrl = `https://drive.google.com/drive/folders/${child.id}`;
         // media[0] after naturalSortByName in listMediaFiles matches the first slide
         // the bot will actually publish — store it so the sorter shows the right thumbnail.

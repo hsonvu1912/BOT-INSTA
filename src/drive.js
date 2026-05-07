@@ -22,7 +22,7 @@ async function getFolderName(drive, folderId) {
   return r.data.name;
 }
 
-async function listMediaFiles(drive, folderId) {
+async function listMediaFiles(drive, folderId, { skipLimitCheck = false } = {}) {
   const files = [];
   let pageToken = undefined;
 
@@ -47,8 +47,7 @@ async function listMediaFiles(drive, folderId) {
     throw new Error("Folder không có file .jpg/.jpeg hoặc .mp4");
   }
 
-  if (media.length > 10) {
-    // IG carousel API limit is 10 items. :contentReference[oaicite:10]{index=10}
+  if (!skipLimitCheck && media.length > 10) {
     throw new Error("Folder có hơn 10 media. API carousel chỉ cho tối đa 10.");
   }
 
