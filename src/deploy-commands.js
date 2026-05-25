@@ -1,10 +1,6 @@
 const { REST, Routes, SlashCommandBuilder } = require("discord.js");
 const { mustEnv } = require("./utils");
 
-const token = mustEnv("DISCORD_TOKEN");
-const clientId = mustEnv("DISCORD_CLIENT_ID");
-const guildId = mustEnv("DISCORD_GUILD_ID");
-
 const commands = [
   new SlashCommandBuilder()
     .setName("ig_schedule")
@@ -113,11 +109,23 @@ const commands = [
     .setDescription("Xem trạng thái pause / rate-limit của bot")
 ].map(c => c.toJSON());
 
-(async () => {
+async function registerCommands({ token, clientId, guildId }) {
   const rest = new REST({ version: "10" }).setToken(token);
   await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
-  console.log("✅ Deployed slash commands to guild.");
-})().catch(e => {
-  console.error(e);
-  process.exit(1);
-});
+  return commands.length;
+}
+
+module.exports = { commands, registerCommands };
+
+if (require.main === module) {
+  (async () => {
+    const token = mustEnv("DISCORD_TOKEN");
+    const clientId = mustEnv("DISCORD_CLIENT_ID");
+    const guildId = mustEnv("DISCORD_GUILD_ID");
+    const n = await registerCommands({ token, clientId, guildId });
+    console.log(`✅ Deployed ${n} slash commands to guild.`);
+  })().catch(e => {
+    console.error(e);
+    process.exit(1);
+  });
+}
