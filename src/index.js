@@ -237,7 +237,7 @@ async function publishJob({ shopKey, caption, mediaFiles, drive }) {
       });
       await waitUntilFinished({ creationId, pageToken: cfg.pageToken, isVideo });
       const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId });
-      const permalink = await igGetPermalink({ mediaId, pageToken: cfg.pageToken });
+      const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken });
       return { mediaId, permalink };
     }
 
@@ -267,7 +267,7 @@ async function publishJob({ shopKey, caption, mediaFiles, drive }) {
     await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken, isVideo: false });
 
     const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId: parentCreationId });
-    const permalink = await igGetPermalink({ mediaId, pageToken: cfg.pageToken });
+    const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken });
     return { mediaId, permalink };
   } finally {
     // ===== v7: Xoá buffer ngay sau khi xong (dù thành công hay thất bại) =====

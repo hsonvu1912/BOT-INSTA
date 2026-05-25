@@ -128,71 +128,19 @@ async function igCreateMediaContainerWithRetry(payload, { retries = 3, delayMs =
   throw lastErr || new Error("Failed to create media container");
 }
 
-async function igGetContainerStatus({ creationId, pageToken }) {
-  const url = `${BASE}/${creationId}`;
-  const r = await axios.get(url, {
-    params: { fields: "status_code,status", access_token: pageToken }
-  });
-  return r.data;
+// Meta deprecated `GET /{container_id}?fields=status_code` for Page Tokens around 2026-05.
+// Polling now returns Authorization Error 100/33 even when the container is fine and publish
+// would succeed. We replace polling with a fixed wait sized to the typical processing time.
+// If the wait is too short, igPublishWithRetry already retries on code 9007 (not ready yet).
+async function waitUntilFinished({ creationId, pageToken, isVideo = false }) {
+  const ms = isVideo ? 25000 : 6000;
+  await new Promise(res => setTimeout(res, ms));
 }
 
-// Smart polling
-async function waitUntilFinished({ creationId, pageToken, timeoutMs = 15 * 60 * 1000, isVideo = false }) {
-  const started = Date.now();
-
-  // Ảnh: check 1 shot sau 2s
-  if (!isVideo) {
-    await new Promise(res => setTimeout(res, 2000));
-    const st = await igGetContainerStatus({ creationId, pageToken });
-    const code = st.status_code || st.status;
-    if (code === "FINISHED") return;
-    if (code === "ERROR") throw new Error(`IG container ERROR: ${JSON.stringify(st)}`);
-  }
-
-  let pollInterval = isVideo ? 8000 : 5000;
-  const maxInterval = isVideo ? 15000 : 10000;
-
-  while (true) {
-    await new Promise(res => setTimeout(res, pollInterval));
-    const st = await igGetContainerStatus({ creationId, pageToken });
-    const code = st.status_code || st.status;
-    if (code === "FINISHED") return;
-    if (code === "ERROR") throw new Error(`IG container ERROR: ${JSON.stringify(st)}`);
-    if (Date.now() - started > timeoutMs) throw new Error(`Timeout: ${creationId}`);
-    pollInterval = Math.min(Math.round(pollInterval * 1.5), maxInterval);
-  }
-}
-
-// Batch poll
-async function waitAllUntilFinished({ items, pageToken, timeoutMs = 15 * 60 * 1000 }) {
-  const started = Date.now();
-  const pending = new Map();
-  for (const it of items) pending.set(it.creationId, { isVideo: it.isVideo });
-
-  // Check 1 shot sau 2.5s
-  await new Promise(res => setTimeout(res, 2500));
-  for (const [cid] of pending) {
-    const st = await igGetContainerStatus({ creationId: cid, pageToken });
-    const code = st.status_code || st.status;
-    if (code === "FINISHED") pending.delete(cid);
-    else if (code === "ERROR") throw new Error(`IG container ERROR: ${cid} | ${JSON.stringify(st)}`);
-  }
-
-  if (pending.size === 0) return;
-  console.log(`[BATCH-POLL] ${items.length - pending.size}/${items.length} done. ${pending.size} remaining...`);
-
-  let pollInterval = 8000;
-  while (pending.size > 0) {
-    await new Promise(res => setTimeout(res, pollInterval));
-    for (const [cid] of pending) {
-      const st = await igGetContainerStatus({ creationId: cid, pageToken });
-      const code = st.status_code || st.status;
-      if (code === "FINISHED") pending.delete(cid);
-      else if (code === "ERROR") throw new Error(`IG container ERROR: ${cid} | ${JSON.stringify(st)}`);
-    }
-    if (Date.now() - started > timeoutMs) throw new Error(`Timeout: ${[...pending.keys()].join(", ")}`);
-    pollInterval = Math.min(Math.round(pollInterval * 1.4), 15000);
-  }
+async function waitAllUntilFinished({ items, pageToken }) {
+  const hasVideo = items.some(it => it.isVideo);
+  const ms = hasVideo ? 45000 : 12000;
+  await new Promise(res => setTimeout(res, ms));
 }
 
 async function igCreateCarouselContainer({ igUserId, pageToken, childrenIds, caption }) {
@@ -233,11 +181,15 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
   }
 }
 
-async function igGetPermalink({ mediaId, pageToken }) {
-  const r = await axios.get(`${BASE}/${mediaId}`, {
-    params: { fields: "permalink", access_token: pageToken }
+// Meta deprecated `GET /{media_id}?fields=permalink` for Page Tokens (~2026-05) —
+// returns code 10 "Insufficient permissions". The list endpoint /{ig_user_id}/media
+// still exposes permalink, so we fetch recent media and pick by id.
+async function igGetPermalink({ igUserId, mediaId, pageToken }) {
+  const r = await axios.get(`${BASE}/${igUserId}/media`, {
+    params: { fields: "id,permalink", limit: 10, access_token: pageToken }
   });
-  return r.data.permalink;
+  const found = (r.data?.data || []).find(m => String(m.id) === String(mediaId));
+  return found?.permalink || `https://www.instagram.com/?mediaid=${mediaId}`;
 }
 
 module.exports = {
