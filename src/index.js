@@ -930,6 +930,22 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
+
+    // Tự đăng ký slash commands khi bot start để không phải chạy `npm run deploy:commands` thủ công.
+    // clientId lấy từ client.user.id (= application ID), guildId vẫn cần env.
+    try {
+      const { registerCommands } = require("./deploy-commands");
+      const guildId = process.env.DISCORD_GUILD_ID;
+      if (guildId) {
+        const n = await registerCommands({ token: DISCORD_TOKEN, clientId: client.user.id, guildId });
+        console.log(`✅ Registered ${n} slash commands to guild ${guildId}`);
+      } else {
+        console.warn("[STARTUP] DISCORD_GUILD_ID not set — skipping slash command registration");
+      }
+    } catch (e) {
+      console.error(`[STARTUP] Slash command registration failed: ${e.message}`);
+    }
+
     setTimeout(() => startTokenReminder(client), 30000);
     registerTestTokenCommand(client);
 
