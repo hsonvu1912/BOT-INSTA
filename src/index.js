@@ -335,6 +335,16 @@ async function cancelSiblingFailedJobs({ sheets, allItems, currentJob }) {
 let tickRunning = false;
 let rateLimitUntilByShop = {};  // { MAUME: timestamp, BURGER: timestamp } — mỗi shop có cooldown riêng vì token riêng
 
+// ===== Manual pause state =====
+// pausedShops: Set chứa các shop key đang bị pause. Nếu chứa "ALL" thì pause toàn bộ.
+// State chỉ lưu trong RAM → bot restart sẽ tự resume. Đây là pause thủ công, khác với rate-limit cooldown.
+const pausedShops = new Set();
+const pauseMetaByShop = {}; // { [shopKey|"ALL"]: { by, at, reason } }
+
+function isShopPaused(shopKey) {
+  return pausedShops.has("ALL") || pausedShops.has(shopKey);
+}
+
 async function tick({ client, sheets, drive }) {
   if (tickRunning) { console.log("[TICK] Skipped"); return; }
   tickRunning = true;
@@ -388,6 +398,12 @@ async function tick({ client, sheets, drive }) {
 
     for (let jobIdx = 0; jobIdx < allJobs.length; jobIdx++) {
       const job = allJobs[jobIdx];
+
+      // Manual pause: skip job nếu shop (hoặc toàn bộ) đang bị pause thủ công
+      if (isShopPaused(job.shop)) {
+        console.log(`[TICK] Skip ${job.shop} job (manually paused) | SKU=${job.sku}`);
+        continue;
+      }
 
       // Per-shop cooldown: skip job nếu shop đang trong RL cooldown
       const shopCooldownUntil = rateLimitUntilByShop[job.shop] || 0;
@@ -476,6 +492,98 @@ async function tick({ client, sheets, drive }) {
       }
     }
   } finally { tickRunning = false; }
+}
+
+function formatPauseScope(scope) {
+  return scope === "ALL" ? "**TẤT CẢ shop**" : `shop **${SHOP[scope]?.name || scope}**`;
+}
+
+async function handleIgPause(interaction) {
+  try { await interaction.deferReply(); } catch { return; }
+  try {
+    const shopOpt = interaction.options.getString("shop") || "ALL";
+    const reason = interaction.options.getString("reason") || "";
+    if (shopOpt !== "ALL" && !SHOP[shopOpt]) throw new Error(`Shop "${shopOpt}" chưa cấu hình.`);
+
+    if (pausedShops.has(shopOpt)) {
+      const meta = pauseMetaByShop[shopOpt];
+      const since = meta ? DateTime.fromISO(meta.at).setZone("Asia/Ho_Chi_Minh").toFormat("yyyy-MM-dd HH:mm") : "?";
+      await interaction.editReply(`ℹ️ ${formatPauseScope(shopOpt)} đã ở trạng thái tạm dừng từ **${since}** (bởi ${meta?.by || "?"}).`);
+      return;
+    }
+
+    pausedShops.add(shopOpt);
+    pauseMetaByShop[shopOpt] = { by: interaction.user.tag, at: nowVn().toISO(), reason };
+    console.log(`[PAUSE] ${shopOpt} paused by ${interaction.user.tag}${reason ? ` — ${reason}` : ""}`);
+
+    let msg = `⏸️ Đã tạm dừng ${formatPauseScope(shopOpt)}.\nCác job PENDING sẽ không được đăng cho tới khi dùng \`/ig_resume\`.`;
+    if (reason) msg += `\nLý do: ${reason}`;
+    await interaction.editReply(msg);
+  } catch (e) {
+    try { await interaction.editReply(`❌ ${e.message}`); } catch {}
+  }
+}
+
+async function handleIgResume(interaction) {
+  try { await interaction.deferReply(); } catch { return; }
+  try {
+    const shopOpt = interaction.options.getString("shop") || "ALL";
+    if (shopOpt !== "ALL" && !SHOP[shopOpt]) throw new Error(`Shop "${shopOpt}" chưa cấu hình.`);
+
+    if (!pausedShops.has(shopOpt)) {
+      // Nếu user resume 1 shop nhưng đang pause ALL → cảnh báo
+      if (shopOpt !== "ALL" && pausedShops.has("ALL")) {
+        await interaction.editReply(`⚠️ Bot đang pause **TẤT CẢ shop**. Dùng \`/ig_resume shop:ALL\` (hoặc không truyền shop) để resume toàn bộ trước.`);
+        return;
+      }
+      await interaction.editReply(`ℹ️ ${formatPauseScope(shopOpt)} không ở trạng thái tạm dừng.`);
+      return;
+    }
+
+    pausedShops.delete(shopOpt);
+    delete pauseMetaByShop[shopOpt];
+    console.log(`[PAUSE] ${shopOpt} resumed by ${interaction.user.tag}`);
+
+    await interaction.editReply(`▶️ Đã tiếp tục ${formatPauseScope(shopOpt)}. Bot sẽ xử lý lại job ở lần tick tới (tối đa 60s).`);
+  } catch (e) {
+    try { await interaction.editReply(`❌ ${e.message}`); } catch {}
+  }
+}
+
+async function handleIgStatus(interaction) {
+  try { await interaction.deferReply(); } catch { return; }
+  try {
+    const lines = ["📊 **Trạng thái bot**"];
+    if (pausedShops.size === 0) {
+      lines.push("• Pause thủ công: ✅ không có shop nào bị pause");
+    } else {
+      lines.push("• Pause thủ công:");
+      for (const scope of pausedShops) {
+        const meta = pauseMetaByShop[scope];
+        const since = meta ? DateTime.fromISO(meta.at).setZone("Asia/Ho_Chi_Minh").toFormat("yyyy-MM-dd HH:mm") : "?";
+        const tail = meta?.reason ? ` — ${meta.reason}` : "";
+        lines.push(`  - ⏸️ ${formatPauseScope(scope)} từ ${since} (bởi ${meta?.by || "?"})${tail}`);
+      }
+    }
+
+    const cooldownLines = [];
+    for (const [shop, until] of Object.entries(rateLimitUntilByShop)) {
+      if (Date.now() < until) {
+        const remainMin = Math.ceil((until - Date.now()) / 60000);
+        cooldownLines.push(`  - ⏳ ${SHOP[shop]?.name || shop}: còn ${remainMin} phút`);
+      }
+    }
+    if (cooldownLines.length) {
+      lines.push("• Rate-limit cooldown:");
+      lines.push(...cooldownLines);
+    } else {
+      lines.push("• Rate-limit cooldown: không");
+    }
+
+    await interaction.editReply(lines.join("\n"));
+  } catch (e) {
+    try { await interaction.editReply(`❌ ${e.message}`); } catch {}
+  }
 }
 
 async function handleIgCancel(interaction, { sheets }) {
@@ -876,6 +984,9 @@ async function main() {
     if (interaction.commandName === "testtoken") return handleTestTokenSlash(interaction, client);
     if (interaction.commandName === "ig_cancel") return handleIgCancel(interaction, { sheets });
     if (interaction.commandName === "ig_folder_schedule") return handleIgFolderSchedule(interaction, { sheets, drive });
+    if (interaction.commandName === "ig_pause") return handleIgPause(interaction);
+    if (interaction.commandName === "ig_resume") return handleIgResume(interaction);
+    if (interaction.commandName === "ig_status") return handleIgStatus(interaction);
     if (interaction.commandName !== "ig_schedule") return;
 
     const t0 = Date.now();

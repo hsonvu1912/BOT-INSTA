@@ -72,6 +72,45 @@ const commands = [
         .setDescription("Link folder CHA chứa các subfolder (mỗi subfolder = 1 bài)")
         .setRequired(true)
     )
+  ,
+  new SlashCommandBuilder()
+    .setName("ig_pause")
+    .setDescription("Tạm dừng bot — các job PENDING sẽ không đăng cho tới khi /ig_resume")
+    .addStringOption(o =>
+      o.setName("shop")
+        .setDescription("Shop cần pause (mặc định: tất cả)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Tất cả shop", value: "ALL" },
+          { name: "Màu mè", value: "MAUME" },
+          { name: "Burger", value: "BURGER" },
+          { name: "Test", value: "TEST" }
+        )
+    )
+    .addStringOption(o =>
+      o.setName("reason")
+        .setDescription("Lý do (tuỳ chọn)")
+        .setRequired(false)
+    )
+  ,
+  new SlashCommandBuilder()
+    .setName("ig_resume")
+    .setDescription("Tiếp tục chạy bot sau khi đã /ig_pause")
+    .addStringOption(o =>
+      o.setName("shop")
+        .setDescription("Shop cần resume (mặc định: tất cả)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Tất cả shop", value: "ALL" },
+          { name: "Màu mè", value: "MAUME" },
+          { name: "Burger", value: "BURGER" },
+          { name: "Test", value: "TEST" }
+        )
+    )
+  ,
+  new SlashCommandBuilder()
+    .setName("ig_status")
+    .setDescription("Xem trạng thái pause / rate-limit của bot")
 ].map(c => c.toJSON());
 
 (async () => {
