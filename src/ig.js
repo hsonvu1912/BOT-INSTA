@@ -3,6 +3,12 @@ const axios = require("axios");
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
+// v8: MỌI call Meta phải có timeout. Không có timeout → 1 socket đơ giữ lock tick
+// vĩnh viễn → bot "sống mà liệt" (sự cố 09/07: treo ở "Not ready 3/8" rồi im).
+// 120s đủ rộng cho container ảnh lớn (Meta fetch ảnh synchronous trong POST /media).
+const HTTP_TIMEOUT_MS = 120 * 1000;
+const ax = axios.create({ timeout: HTTP_TIMEOUT_MS });
+
 function pickMediaUrls(payload) {
   const img = payload.imageUrl ?? payload.image_url ?? null;
   const vid = payload.videoUrl ?? payload.video_url ?? null;
@@ -43,7 +49,15 @@ function isImageFormatError(e) {
 
 function isRateLimitError(e) {
   const err = e?.response?.data?.error;
-  return err?.code === 4 || err?.code === 32 || err?.code === 613;
+  const code = err?.code;
+  // v8: bổ sung mã throttle chính thức của Graph API:
+  //  4=app, 17=user, 32=page, 613=custom rate limit, 80001-80007=BUC (business use case).
+  //  Thiếu 17 khiến đăng dày bị coi là lỗi thường → cháy 3 attempts trong ~1 phút → GIVE_UP oan.
+  if (code === 4 || code === 17 || code === 32 || code === 613) return true;
+  if (typeof code === "number" && code >= 80001 && code <= 80007) return true;
+  // HTTP 429 (Too Many Requests) — một số throttle trả status thay vì error.code
+  if (e?.response?.status === 429) return true;
+  return false;
 }
 
 // ===== v7: Gộp tất cả lỗi "Meta fetch fail" để retry chung =====
@@ -66,7 +80,7 @@ async function igCreateMediaContainer(payload) {
   params.set("access_token", pageToken);
 
   const url = `${BASE}/${igUserId}/media`;
-  const r = await axios.post(url, params);
+  const r = await ax.post(url, params);
   return r.data.id;
 }
 
@@ -149,7 +163,7 @@ async function igCreateCarouselContainer({ igUserId, pageToken, childrenIds, cap
   params.set("children", childrenIds.join(","));
   if (caption) params.set("caption", caption);
   params.set("access_token", pageToken);
-  const r = await axios.post(`${BASE}/${igUserId}/media`, params);
+  const r = await ax.post(`${BASE}/${igUserId}/media`, params);
   return r.data.id;
 }
 
@@ -157,7 +171,7 @@ async function igPublish({ igUserId, pageToken, creationId }) {
   const params = new URLSearchParams();
   params.set("creation_id", creationId);
   params.set("access_token", pageToken);
-  const r = await axios.post(`${BASE}/${igUserId}/media_publish`, params);
+  const r = await ax.post(`${BASE}/${igUserId}/media_publish`, params);
   return r.data.id;
 }
 
@@ -185,7 +199,7 @@ async function igPublishWithRetry({ igUserId, pageToken, creationId, retries = 8
 // returns code 10 "Insufficient permissions". The list endpoint /{ig_user_id}/media
 // still exposes permalink, so we fetch recent media and pick by id.
 async function igGetPermalink({ igUserId, mediaId, pageToken }) {
-  const r = await axios.get(`${BASE}/${igUserId}/media`, {
+  const r = await ax.get(`${BASE}/${igUserId}/media`, {
     params: { fields: "id,permalink", limit: 10, access_token: pageToken }
   });
   const found = (r.data?.data || []).find(m => String(m.id) === String(mediaId));

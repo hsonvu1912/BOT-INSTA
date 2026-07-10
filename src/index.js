@@ -17,7 +17,7 @@ const {
   listMediaFiles, listChildFolders, driveDirectDownloadUrl
 } = require("./drive");
 
-const { parseVnDatetime, appendJob, fetchAllJobs, updateRow, nowVn } = require("./queue");
+const { parseVnDatetime, appendJob, fetchAllJobs, updateRow, readRowCreatedAt, nowVn } = require("./queue");
 
 const {
   igCreateMediaContainerWithRetry, igCreateCarouselContainer,
@@ -95,8 +95,22 @@ function tabIsLikelyInventory(title) {
   return true;
 }
 
+// v8: Tab kho đặt tên "Tháng M/YYYY" — so chuỗi thuần thì "Tháng 12/2025" đứng
+// TRƯỚC "Tháng 7/2026" (12 > 7, năm nằm sau tháng nên không được xét) → SKU trùng
+// ở 2 tab sẽ lấy caption/ghi kho nhầm tab CŨ. Parse (year, month) để sort đúng.
+function tabDateKey(title) {
+  const m = String(title).match(/(\d{1,2})\s*\/\s*(\d{4})/);
+  return m ? Number(m[2]) * 100 + Number(m[1]) : null; // YYYYMM
+}
+
 function sortTabsNewestFirst(titles) {
-  return [...titles].sort((a, b) => b.localeCompare(a, "en", { numeric: true, sensitivity: "base" }));
+  return [...titles].sort((a, b) => {
+    const ka = tabDateKey(a), kb = tabDateKey(b);
+    if (ka !== null && kb !== null && ka !== kb) return kb - ka;
+    if (ka !== null && kb === null) return -1; // tab có tháng/năm ưu tiên trước
+    if (ka === null && kb !== null) return 1;
+    return b.localeCompare(a, "en", { numeric: true, sensitivity: "base" });
+  });
 }
 
 async function getTabTitles(sheets, spreadsheetId) {
@@ -189,6 +203,38 @@ async function updateKhoPostStatus({ sheets, shopKey, tabName, rowNum }) {
   return valueToWrite;
 }
 
+// v8 #3+#4: quyết định bỏ 1 job (thuần, không I/O — dễ test). Trả "cancelled" nếu row
+// vừa bị /ig_cancel giữa tick, "dup" nếu shop+SKU đã đăng trong chính tick này, else null.
+function jobSkipReason(job, { successKeys, cancelledRowNums }) {
+  if (cancelledRowNums.has(job.rowNum)) return "cancelled";
+  if (successKeys.has(`${job.shop}::${canonSku(job.sku)}`)) return "dup";
+  return null;
+}
+
+// ===== v8: Watchdog helpers =====
+// Bọc 1 promise trong timeout — chống awaited-call treo vĩnh viễn giữ lock tick
+// (sự cố 09/07). Timeout → job FAILED + auto-retry thay vì bot liệt.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timeout sau ${Math.round(ms / 60000)} phút`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Retry ghi sổ (Sheets hay 503) — dùng cho các update KHÔNG được phép phá job.
+async function updateRowWithRetry(sheets, args, { tries = 3, gapMs = 5000 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await updateRow(sheets, args); }
+    catch (e) {
+      lastErr = e;
+      if (i < tries - 1) await new Promise(r => setTimeout(r, gapMs));
+    }
+  }
+  throw lastErr;
+}
+
 function isVideoName(name) { return /\.mp4$/i.test(name || ""); }
 
 function prioritizeVideosFirst(mediaFiles) {
@@ -236,8 +282,13 @@ async function publishJob({ shopKey, caption, mediaFiles, drive }) {
         caption, isCarouselItem: false
       });
       await waitUntilFinished({ creationId, pageToken: cfg.pageToken, isVideo });
-      const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId });
-      const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken });
+      // v8: video cần Meta transcode lâu — publish lại CÙNG container (sống ~24h) nhiều
+      // lần thay vì để job-retry tạo container mới (reset đồng hồ transcode). 20×15s=5phút.
+      const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId, retries: isVideo ? 20 : 8 });
+      // v8: từ đây bài ĐÃ lên IG — lỗi lấy permalink không được phá job (throw →
+      // FAILED → retry → đăng TRÙNG). Fallback URL là đủ.
+      const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken })
+        .catch(() => `https://www.instagram.com/?mediaid=${mediaId}`);
       return { mediaId, permalink };
     }
 
@@ -266,8 +317,12 @@ async function publishJob({ shopKey, caption, mediaFiles, drive }) {
     });
     await waitUntilFinished({ creationId: parentCreationId, pageToken: cfg.pageToken, isVideo: false });
 
-    const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId: parentCreationId });
-    const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken });
+    // v8: carousel chứa video → cho publish container CHA nhiều lần hơn
+    const carouselHasVideo = children.some(c => c.isVideo);
+    const mediaId = await igPublishWithRetry({ igUserId: cfg.igUserId, pageToken: cfg.pageToken, creationId: parentCreationId, retries: carouselHasVideo ? 20 : 8 });
+    // v8: bài đã lên IG — permalink lỗi chỉ fallback, không throw (tránh đăng trùng)
+    const permalink = await igGetPermalink({ igUserId: cfg.igUserId, mediaId, pageToken: cfg.pageToken })
+      .catch(() => `https://www.instagram.com/?mediaid=${mediaId}`);
     return { mediaId, permalink };
   } finally {
     // ===== v7: Xoá buffer ngay sau khi xong (dù thành công hay thất bại) =====
@@ -333,7 +388,21 @@ async function cancelSiblingFailedJobs({ sheets, allItems, currentJob }) {
 }
 
 let tickRunning = false;
+let tickStartedAt = 0; // v8: watchdog — biết lock bị giữ bao lâu
 let rateLimitUntilByShop = {};  // { MAUME: timestamp, BURGER: timestamp } — mỗi shop có cooldown riêng vì token riêng
+
+// v8: 1 job publish tối đa 20 phút (bình thường <3 phút kể cả video retry).
+// Quá hạn → job FAILED + auto-retry, lock được nhả — bot KHÔNG BAO GIỜ liệt như 09/07.
+const PUBLISH_JOB_TIMEOUT_MS = 20 * 60 * 1000;
+
+// v8: rows đã đăng IG thành công nhưng ghi SUCCESS vào sheet thất bại (Sheets 503).
+// Recovery phải bỏ qua các row này để không retry → đăng trùng.
+const bookkeepingFailedRows = new Set();
+
+// v8 #3: rowNum bị /ig_cancel thu hồi TRONG LÚC tick đang chạy batch. Tick chốt
+// danh sách due lúc T0 rồi xử lý tuần tự nhiều phút — nếu user thu hồi giữa chừng,
+// row này phải được bỏ qua trước khi publish (TOCTOU). handleIgCancel ghi vào đây.
+const cancelledRowNums = new Set();
 
 // ===== Manual pause state =====
 // pausedShops: Set chứa các shop key đang bị pause. Nếu chứa "ALL" thì pause toàn bộ.
@@ -346,12 +415,41 @@ function isShopPaused(shopKey) {
 }
 
 async function tick({ client, sheets, drive }) {
-  if (tickRunning) { console.log("[TICK] Skipped"); return; }
+  if (tickRunning) {
+    // v8: watchdog — nếu lock bị giữ quá lâu thì la lên thay vì Skipped âm thầm
+    const heldMin = Math.round((Date.now() - tickStartedAt) / 60000);
+    if (heldMin >= 10) console.error(`[TICK] Skipped — lock held ${heldMin}m (nghi treo; watchdog publishJob sẽ tự nhả trong tối đa ${PUBLISH_JOB_TIMEOUT_MS / 60000}m)`);
+    else console.log("[TICK] Skipped");
+    return;
+  }
   tickRunning = true;
+  tickStartedAt = Date.now();
 
   try {
     const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
     const now = nowVn();
+
+    // ===== v8: Recovery — job kẹt RUNNING/RETRYING do bot restart giữa chừng =====
+    // Tick là single-flight (lock): tại ĐẦU tick không thể có job nào đang chạy thật
+    // trong process này → mọi row RUNNING/RETRYING là xác chết từ trước restart.
+    // Bản cũ bỏ mặc chúng vĩnh viễn → bài âm thầm không bao giờ đăng.
+    for (const j of items) {
+      if (j.status !== "RUNNING" && !j.status.startsWith("RETRYING")) continue;
+      if (bookkeepingFailedRows.has(j.rowNum)) continue; // bài đã lên IG, chỉ lỗi ghi sổ
+      const newStatus = j.attempts >= MAX_AUTO_RETRIES ? "GIVE_UP" : "FAILED";
+      try {
+        await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: j.rowNum,
+          patch: { status: newStatus, last_error: `Auto-recover: kẹt ${j.status} (bot restart giữa chừng publish)` } });
+        j.status = newStatus;
+        console.log(`[RECOVER] row=${j.rowNum} SKU=${j.sku} → ${newStatus}${newStatus === "FAILED" ? " (sẽ tự retry)" : ""}`);
+        if (newStatus === "GIVE_UP") {
+          const ch = await client.channels.fetch(j.channel_id).catch(() => null);
+          if (ch) await ch.send(`❌ Job kẹt giữa chừng do bot restart, đã hết ${MAX_AUTO_RETRIES} lần thử (${SHOP[j.shop]?.name || j.shop}) | SKU: **${j.sku}**\n⚠️ **Nhờ đăng tay + cập nhật kho!**`).catch(() => {});
+        }
+      } catch (e) {
+        console.error(`[RECOVER] update failed row=${j.rowNum}: ${e.message}`);
+      }
+    }
 
     const successKeys = new Set();
     for (const j of items) { if (j.status === "SUCCESS") successKeys.add(`${j.shop}::${canonSku(j.sku)}`); }
@@ -413,8 +511,38 @@ async function tick({ client, sheets, drive }) {
         continue;
       }
 
+      // v8 #3+#4: guard chống đăng nhầm/đăng trùng, tính TRONG vòng lặp (in-RAM, không tốn quota)
+      const skipReason = jobSkipReason(job, { successKeys, cancelledRowNums });
+      if (skipReason === "cancelled") {
+        // #3: bị /ig_cancel thu hồi giữa chừng tick
+        console.log(`[TICK] Skip row=${job.rowNum} (đã /ig_cancel giữa chừng) | SKU=${job.sku}`);
+        continue;
+      }
+      if (skipReason === "dup") {
+        // #4: cùng shop+SKU đã đăng ở vòng trước của CHÍNH tick này (pha phân loại chỉ check 1 lần đầu)
+        console.log(`[TICK] Skip row=${job.rowNum} (SKU=${job.sku} đã đăng trong tick này) → CANCELLED_DUP`);
+        await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
+          patch: { status: "CANCELLED_DUP", last_error: "Đã đăng bởi row khác cùng tick" } }).catch(() => {});
+        continue;
+      }
+
+      // v8 #11: sheet QUEUE bị sửa tay (xoá/chèn/sort hàng) giữa lúc tick chạy →
+      // rowNum snapshot trỏ sang hàng KHÁC. Verify created_at (cột A) trước khi ghi/đăng;
+      // lệch thì bỏ qua an toàn (tick sau fetch lại rowNum đúng) thay vì ghi nhầm hàng.
+      if (job.created_at) {
+        const liveCreatedAt = await readRowCreatedAt(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum }).catch(() => null);
+        if (liveCreatedAt !== null && liveCreatedAt !== job.created_at) {
+          console.error(`[GUARD] row=${job.rowNum} created_at lệch ("${liveCreatedAt}" != "${job.created_at}") — sheet bị sửa tay? Bỏ job này để không ghi/đăng nhầm hàng.`);
+          continue;
+        }
+      }
+
       const isRetry = job.status === "FAILED";
       const channel = await client.channels.fetch(job.channel_id).catch(() => null);
+
+      // v8: set sau khi IG publish OK — từ đó trở đi catch KHÔNG được đánh FAILED
+      // (bài đã lên IG, retry sẽ đăng trùng)
+      let published = null;
 
       try {
         await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
@@ -422,7 +550,8 @@ async function tick({ client, sheets, drive }) {
         });
 
         if (isRetry && channel) {
-          await channel.send(`🔄 Auto-retry ${job.attempts+1}/${MAX_AUTO_RETRIES} (${SHOP[job.shop]?.name}) | SKU: **${job.sku}**`);
+          // v8 #5: notify KHÔNG được throw ra ngoài (mất quyền SendMessages → job FAILED oan)
+          await channel.send(`🔄 Auto-retry ${job.attempts+1}/${MAX_AUTO_RETRIES} (${SHOP[job.shop]?.name}) | SKU: **${job.sku}**`).catch(() => {});
         }
 
         const folderName = await getFolderName(drive, job.folder_id);
@@ -432,11 +561,33 @@ async function tick({ client, sheets, drive }) {
         const { caption, tabName: khoTab, rowNum: khoRow } = skuResult;
         const mediaFiles = await listMediaFiles(drive, job.folder_id);
 
-        const { mediaId, permalink } = await publishJob({ shopKey: job.shop, caption, mediaFiles, drive });
+        // v8: watchdog — publishJob treo (socket đơ, promise mồ côi) tối đa 20 phút
+        // là bị cắt thành lỗi thường → job FAILED + auto-retry, lock được nhả.
+        published = await withTimeout(
+          publishJob({ shopKey: job.shop, caption, mediaFiles, drive }),
+          PUBLISH_JOB_TIMEOUT_MS, `publishJob SKU=${sku}`
+        );
+        const { mediaId, permalink } = published;
 
-        await updateRow(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
-          patch: { status: "SUCCESS", attempts: job.attempts+1, ig_media_id: mediaId, ig_permalink: permalink, published_at: nowVn().toISO() }
-        });
+        // ===== v8: từ đây bài ĐÃ lên IG — lỗi ghi sổ không được phá job =====
+        let successWritten = false;
+        try {
+          await updateRowWithRetry(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
+            patch: { status: "SUCCESS", attempts: job.attempts+1, last_error: "", ig_media_id: mediaId, ig_permalink: permalink, published_at: nowVn().toISO() }
+          });
+          successWritten = true;
+        } catch {
+          // fallback tối thiểu: chỉ ghi status để chặn retry
+          try {
+            await updateRowWithRetry(sheets, { queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum, patch: { status: "SUCCESS" } });
+            successWritten = true;
+          } catch {}
+        }
+        if (!successWritten) {
+          bookkeepingFailedRows.add(job.rowNum);
+          console.error(`[BOOKKEEPING] Ghi SUCCESS thất bại row=${job.rowNum} — bài ĐÃ lên IG: ${permalink}. Chặn auto-retry để tránh đăng trùng.`);
+          if (channel) await channel.send(`⚠️ Bài **ĐÃ ĐĂNG** (${permalink}) nhưng ghi sheet thất bại nhiều lần.\n👉 **Sửa tay row ${job.rowNum} trong QUEUE thành SUCCESS** kẻo bot restart có thể đăng lại.`).catch(() => {});
+        }
 
         const cancelled = await cancelSiblingFailedJobs({ sheets, allItems: items, currentJob: job });
         if (cancelled) console.log(`[DEDUP] Cancelled ${cancelled} dups for SKU=${sku}`);
@@ -446,15 +597,22 @@ async function tick({ client, sheets, drive }) {
           const sv = await updateKhoPostStatus({ sheets, shopKey: job.shop, tabName: khoTab, rowNum: khoRow });
           if (channel) {
             const note = isRetry ? " (auto-retry OK)" : "";
-            await channel.send(`✅ Thành công${note} (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n📋 Kho → **${sv}**`);
+            await channel.send(`✅ Thành công${note} (${SHOP[job.shop].name}) | SKU: **${sku}** | ${permalink}\n📋 Kho → **${sv}**`).catch(() => {});
           }
         } catch (khoErr) {
-          if (channel) await channel.send(`✅ IG OK (${SHOP[job.shop].name}) | ${permalink}\n⚠️ Lỗi kho: ${khoErr.message}`);
+          if (channel) await channel.send(`✅ IG OK (${SHOP[job.shop].name}) | ${permalink}\n⚠️ Lỗi kho: ${khoErr.message}`).catch(() => {});
         }
 
         consecutiveJobCount++;
 
       } catch (e) {
+        // v8: bài đã lên IG mà lỗi ở khâu sau (kho/notify/dedup) → KHÔNG đánh FAILED
+        // (row đã là SUCCESS hoặc đã được bookkeepingFailedRows chặn retry)
+        if (published) {
+          console.error(`[TICK] Lỗi hậu-publish (bài đã lên IG ${published.permalink}) row=${job.rowNum}: ${e.message}`);
+          consecutiveJobCount++;
+          continue;
+        }
         const msg = (e.response?.data && JSON.stringify(e.response.data)) ? JSON.stringify(e.response.data) : (e.message || String(e));
         const isRL = isRateLimitError(e);
         let newStatus = isRL ? "PENDING" : (job.attempts+1 < MAX_AUTO_RETRIES ? "FAILED" : "GIVE_UP");
@@ -466,12 +624,13 @@ async function tick({ client, sheets, drive }) {
         });
 
         if (channel) {
+          // v8 #5: send trong catch nếu throw sẽ thoát catch → huỷ cả vòng for (bỏ các job due còn lại). Bọc .catch.
           if (isRL) {
             const resumeAt = DateTime.fromMillis(Date.now() + RATE_LIMIT_COOLDOWN_MS).setZone("Asia/Ho_Chi_Minh");
-            await channel.send(`⏸️ **Instagram rate limit (${SHOP[job.shop].name})** | SKU: **${job.sku}**\nShop này tạm dừng **${RATE_LIMIT_COOLDOWN_MS/60000} phút** (đến **${resumeAt.toFormat("HH:mm")}**). Shop khác vẫn chạy. Job sẽ tự retry sau cooldown.\n\`\`\`${msg.slice(0,1500)}\`\`\``);
+            await channel.send(`⏸️ **Instagram rate limit (${SHOP[job.shop].name})** | SKU: **${job.sku}**\nShop này tạm dừng **${RATE_LIMIT_COOLDOWN_MS/60000} phút** (đến **${resumeAt.toFormat("HH:mm")}**). Shop khác vẫn chạy. Job sẽ tự retry sau cooldown.\n\`\`\`${msg.slice(0,1500)}\`\`\``).catch(() => {});
           }
-          else if (newStatus === "FAILED") await channel.send(`⚠️ Lỗi ${job.attempts+1}/${MAX_AUTO_RETRIES}, retry ${RETRY_BACKOFF_MS/1000}s (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1200)}\`\`\``);
-          else await channel.send(`❌ Thất bại ${MAX_AUTO_RETRIES} lần (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1500)}\`\`\`\n⚠️ **Nhờ đăng tay + cập nhật kho!**`);
+          else if (newStatus === "FAILED") await channel.send(`⚠️ Lỗi ${job.attempts+1}/${MAX_AUTO_RETRIES}, retry ${RETRY_BACKOFF_MS/1000}s (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1200)}\`\`\``).catch(() => {});
+          else await channel.send(`❌ Thất bại ${MAX_AUTO_RETRIES} lần (${SHOP[job.shop].name}) | SKU: **${job.sku}**\n\`\`\`${msg.slice(0,1500)}\`\`\`\n⚠️ **Nhờ đăng tay + cập nhật kho!**`).catch(() => {});
         }
 
         if (isRL) {
@@ -491,7 +650,12 @@ async function tick({ client, sheets, drive }) {
         }
       }
     }
-  } finally { tickRunning = false; }
+  } finally {
+    // v8 #3: dọn Set sau mỗi tick — row đã ghi CANCELLED vào sheet nên tick sau tự loại,
+    // không cần giữ rowNum trong RAM (tránh Set phình vô hạn).
+    cancelledRowNums.clear();
+    tickRunning = false;
+  }
 }
 
 function formatPauseScope(scope) {
@@ -598,18 +762,21 @@ async function handleIgCancel(interaction, { sheets }) {
 
     const { items } = await fetchAllJobs(sheets, { queueSheetId: QUEUE_SHEET_ID });
     const targetCanon = canonSku(sku);
-    // Also include DRAFT rows so a user who regrets a /ig_folder_schedule batch can
-    // clean up without having to open the sorter Web App.
+    // v8 #3: thu hồi cả job đang chờ auto-retry (FAILED / "RETRYING (x/y)") — trước đây
+    // chỉ huỷ PENDING/DRAFT nên user thu hồi xong bot vẫn đăng ở lần retry kế tiếp.
     const pending = items.filter(j =>
-      j.shop === shopKey && (j.status === "PENDING" || j.status === "DRAFT") && canonSku(j.sku) === targetCanon
+      j.shop === shopKey && canonSku(j.sku) === targetCanon &&
+      (j.status === "PENDING" || j.status === "DRAFT" || j.status === "FAILED" || j.status.startsWith("RETRYING"))
     );
 
     if (!pending.length) {
-      await interaction.editReply(`❌ Không tìm thấy lịch PENDING/DRAFT cho SKU=**${sku}** shop **${SHOP[shopKey].name}**`);
+      await interaction.editReply(`❌ Không tìm thấy lịch đang chờ (PENDING/DRAFT/đang retry) cho SKU=**${sku}** shop **${SHOP[shopKey].name}**`);
       return;
     }
 
     for (const job of pending) {
+      // v8 #3: chặn tick đang chạy publish row này giữa chừng (TOCTOU) — set TRƯỚC khi ghi sheet
+      cancelledRowNums.add(job.rowNum);
       await updateRow(sheets, {
         queueSheetId: QUEUE_SHEET_ID, rowNum: job.rowNum,
         patch: { status: "CANCELLED", last_error: `Thu hồi bởi ${interaction.user.tag}` }
@@ -843,9 +1010,9 @@ async function handleIgFolderSchedule(interaction, { sheets, drive }) {
 
         const mediaFiles = await listMediaFiles(drive, child.id, { skipLimitCheck: true });
         const childFolderUrl = `https://drive.google.com/drive/folders/${child.id}`;
-        // media[0] after naturalSortByName in listMediaFiles matches the first slide
-        // the bot will actually publish — store it so the sorter shows the right thumbnail.
-        const firstMediaId = mediaFiles[0]?.id || "";
+        // v8: bot đăng theo prioritizeVideosFirst (video lên slide 1) — thumbnail
+        // sorter phải lấy đúng file đầu theo thứ tự ĐĂNG THẬT, không phải theo tên.
+        const firstMediaId = prioritizeVideosFirst(mediaFiles)[0]?.id || "";
 
         await appendJob(sheets, { queueSheetId: QUEUE_SHEET_ID, job: {
           created_at: nowVn().toISO(), requester_id: interaction.user.id, requester_tag: interaction.user.tag,
@@ -1061,4 +1228,12 @@ async function main() {
   await client.login(DISCORD_TOKEN);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+if (require.main === module) {
+  main().catch(e => { console.error(e); process.exit(1); });
+}
+
+// v8: export hàm thuần để test offline (không side-effect — main() chỉ chạy khi là entrypoint)
+module.exports = {
+  canonSku, sortTabsNewestFirst, tabDateKey, withTimeout,
+  prioritizeVideosFirst, chunkLinesForDiscord, pickPostedValue, jobSkipReason, tick
+};

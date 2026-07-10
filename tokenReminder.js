@@ -24,8 +24,8 @@ function previewToken(t) {
 
 function httpsGetJson(url) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
+    const req = https
+      .get(url, { timeout: 30000 }, (res) => {
         let buf = "";
         res.on("data", (c) => (buf += c));
         res.on("end", () => {
@@ -42,6 +42,8 @@ function httpsGetJson(url) {
         });
       })
       .on("error", reject);
+    // v8: socket đơ không giữ promise vĩnh viễn
+    req.on("timeout", () => req.destroy(new Error("Request timeout (30s)")));
   });
 }
 

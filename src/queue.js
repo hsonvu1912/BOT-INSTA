@@ -84,24 +84,43 @@ async function fetchAllJobs(sheets, { queueSheetId }) {
   return { header, items };
 }
 
-async function updateRow(sheets, { queueSheetId, rowNum, patch }) {
-  // Columns: J=status, K=attempts, L=last_error, M=ig_media_id, N=ig_permalink, O=published_at
-  const range = `${QUEUE_TAB}!J${rowNum}:O${rowNum}`;
-  const values = [[
-    patch.status ?? "",
-    String(patch.attempts ?? ""),
-    patch.last_error ?? "",
-    patch.ig_media_id ?? "",
-    patch.ig_permalink ?? "",
-    patch.published_at ?? ""
-  ]];
+// Columns: J=status, K=attempts, L=last_error, M=ig_media_id, N=ig_permalink, O=published_at
+const PATCH_COLS = {
+  status: "J",
+  attempts: "K",
+  last_error: "L",
+  ig_media_id: "M",
+  ig_permalink: "N",
+  published_at: "O"
+};
 
-  await sheets.spreadsheets.values.update({
+async function updateRow(sheets, { queueSheetId, rowNum, patch }) {
+  // v8: CHỈ ghi các field có mặt trong patch. Bản cũ ghi nguyên khối J:O nên
+  // patch thiếu field nào là field đó bị xoá trắng (mất attempts/permalink âm thầm).
+  const data = [];
+  for (const [key, col] of Object.entries(PATCH_COLS)) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    const v = patch[key];
+    data.push({
+      range: `${QUEUE_TAB}!${col}${rowNum}`,
+      values: [[key === "attempts" ? String(v ?? "") : (v ?? "")]]
+    });
+  }
+  if (!data.length) return;
+
+  await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: queueSheetId,
-    range,
-    valueInputOption: "RAW",
-    requestBody: { values }
+    requestBody: { valueInputOption: "RAW", data }
   });
 }
 
-module.exports = { nowVn, parseVnDatetime, appendJob, fetchAllJobs, updateRow };
+// v8: đọc created_at (cột A) của 1 row để verify rowNum còn trỏ đúng job trước khi ghi.
+async function readRowCreatedAt(sheets, { queueSheetId, rowNum }) {
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId: queueSheetId,
+    range: `${QUEUE_TAB}!A${rowNum}`
+  });
+  return (r.data.values?.[0]?.[0] ?? "").toString();
+}
+
+module.exports = { nowVn, parseVnDatetime, appendJob, fetchAllJobs, updateRow, readRowCreatedAt };
