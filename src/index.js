@@ -1097,6 +1097,8 @@ async function main() {
 
   client.on("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
+    // v8: deploy marker — xác nhận bản đang chạy trong Railway log (grep "[BOOT] v8")
+    console.log(`[BOOT] BOT-INSTA v8 (11 bug fix: timeout/watchdog/recovery/anti-dup) @ ${new Date().toISOString()}`);
 
     // Tự đăng ký slash commands khi bot start để không phải chạy `npm run deploy:commands` thủ công.
     // clientId lấy từ client.user.id (= application ID), guildId vẫn cần env.
