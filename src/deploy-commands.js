@@ -107,6 +107,13 @@ const commands = [
   new SlashCommandBuilder()
     .setName("ig_status")
     .setDescription("Xem trạng thái pause / rate-limit của bot")
+  ,
+  // 22/08/2026: /testtoken trước đây chỉ được tokenReminder tự tạo lúc boot. Vì rest.put
+  // ở dưới là GHI ĐÈ TRỌN BỘ, mỗi lần chạy `npm run deploy:commands` là lệnh này biến mất
+  // cho tới lần boot sau. Đưa vào đây để nó là lệnh chính thức, không còn phụ thuộc may rủi.
+  new SlashCommandBuilder()
+    .setName("testtoken")
+    .setDescription("Check token các shop ngay (có gọi thử API thật) và gửi report lên kênh log")
 ].map(c => c.toJSON());
 
 async function registerCommands({ token, clientId, guildId }) {
