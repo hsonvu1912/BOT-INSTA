@@ -218,6 +218,7 @@ function collectShops() {
     { key: "MAUME", name: "MauMe", tokenVar: "FB_PAGE_TOKEN_MAUME", idVar: "IG_USER_ID_MAUME", required: true },
     { key: "BURGER", name: "Burger", tokenVar: "FB_PAGE_TOKEN_BURGER", idVar: "IG_USER_ID_BURGER", required: true },
     { key: "TEST", name: "Test", tokenVar: "FB_PAGE_TOKEN_TEST", idVar: "IG_USER_ID_TEST", required: false },
+    { key: "AO", name: "Áo", tokenVar: "FB_PAGE_TOKEN_AO", idVar: "IG_USER_ID_AO", required: false },
   ];
   const shops = [];
   const missing = [];

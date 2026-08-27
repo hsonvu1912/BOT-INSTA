@@ -12,7 +12,8 @@ const commands = [
         .addChoices(
           { name: "Màu mè", value: "MAUME" },
           { name: "Burger", value: "BURGER" },
-          { name: "Test", value: "TEST" }
+          { name: "Test", value: "TEST" },
+          { name: "Áo", value: "AO" }
         )
     )
     .addStringOption(o =>
@@ -36,7 +37,8 @@ const commands = [
         .addChoices(
           { name: "Màu mè", value: "MAUME" },
           { name: "Burger", value: "BURGER" },
-          { name: "Test", value: "TEST" }
+          { name: "Test", value: "TEST" },
+          { name: "Áo", value: "AO" }
         )
     )
     .addStringOption(o =>
@@ -55,7 +57,8 @@ const commands = [
         .addChoices(
           { name: "Màu mè", value: "MAUME" },
           { name: "Burger", value: "BURGER" },
-          { name: "Test", value: "TEST" }
+          { name: "Test", value: "TEST" },
+          { name: "Áo", value: "AO" }
         )
     )
     .addStringOption(o =>
@@ -80,7 +83,8 @@ const commands = [
           { name: "Tất cả shop", value: "ALL" },
           { name: "Màu mè", value: "MAUME" },
           { name: "Burger", value: "BURGER" },
-          { name: "Test", value: "TEST" }
+          { name: "Test", value: "TEST" },
+          { name: "Áo", value: "AO" }
         )
     )
     .addStringOption(o =>
@@ -100,7 +104,8 @@ const commands = [
           { name: "Tất cả shop", value: "ALL" },
           { name: "Màu mè", value: "MAUME" },
           { name: "Burger", value: "BURGER" },
-          { name: "Test", value: "TEST" }
+          { name: "Test", value: "TEST" },
+          { name: "Áo", value: "AO" }
         )
     )
   ,

@@ -76,6 +76,24 @@ if (testIgUserId && testPageToken && testSheetId) {
   console.log("[CONFIG] TEST shop not configured");
 }
 
+// Shop ÁO (27/08/2026): sheet "Kho áo" layout KHÁC Màu Mè — caption vẫn ở E nhưng
+// MÃ ở cột J (không phải L). Đo thật tab 08/2026: B=TRẠNG THÁI ĐĂNG BÀI (dropdown
+// Đã đăng/Chưa đăng), E=NỘI DUNG, J=MÃ (A001…). Range "E:J" KHÔNG kèm số dòng —
+// kèm số là rowNum lệch, ghi "Đã đăng" nhầm dòng.
+const aoIgUserId = optEnv("IG_USER_ID_AO");
+const aoPageToken = optEnv("FB_PAGE_TOKEN_AO");
+const aoSheetId = optEnv("SHEET_ID_AO");
+if (aoIgUserId && aoPageToken && aoSheetId) {
+  SHOP.AO = {
+    name: "Áo", igUserId: aoIgUserId, pageToken: aoPageToken,
+    sheetId: aoSheetId, sheetTab: null, sheetRange: "E:J",
+    captionColIndexInRange: 0, codeColIndexInRange: 5, khoStatusCol: "B"
+  };
+  console.log("[CONFIG] AO shop enabled");
+} else {
+  console.log("[CONFIG] AO shop not configured");
+}
+
 // ===== SKU lookup =====
 const TAB_CACHE_TTL_MS = 10 * 60 * 1000;
 const tabCache = new Map();

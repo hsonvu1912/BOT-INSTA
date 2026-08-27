@@ -50,7 +50,12 @@ t("code 190 KHONG phai tam thoi", () => assert(!isTransient({ response: { status
 
 console.log("\n-- B. Shop duoc giam sat --");
 const { shops } = collectShops();
-t("du 3 shop ke ca TEST (v1 bo sot TEST)", () => { assert.strictEqual(shops.length, 3, "thay " + shops.map((s) => s.name)); assert(shops.some((s) => s.key === "TEST")); });
+t("du shop theo env co mat, ke ca TEST (v1 bo sot TEST)", () => {
+  // dem dong: AO chi xuat hien khi FB_PAGE_TOKEN_AO da duoc set tren Railway
+  const expected = ["MAUME", "BURGER", "TEST", "AO"].filter((k) => (process.env["FB_PAGE_TOKEN_" + k] || "").trim().length > 20).length;
+  assert.strictEqual(shops.length, expected, "thay " + shops.map((s) => s.name));
+  assert(shops.some((s) => s.key === "TEST"));
+});
 t("moi shop deu co igUserId de probe", () => shops.forEach((s) => assert(s.igUserId, s.name + " thieu igUserId")));
 const burger = shops.find((s) => s.key === "BURGER");
 
